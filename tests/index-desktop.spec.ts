@@ -381,8 +381,14 @@ describe('host adaptation', () => {
       runtime: state.runtime,
     })
 
-    expect(ctx.effects).toHaveLength(1)
-    await ctx.effects[0].dispose()
+    // Two effects: the launcher's install anchor (wired before anything
+    // mounts, #473/#404/#426) and the mount itself. Select the mount by its
+    // label rather than by position — the anchor is registered first, so
+    // index 0 stops meaning "the routes" the moment it exists.
+    expect(ctx.effects).toHaveLength(2)
+    const routes = ctx.effects.find(entry => entry.label.includes('Desktop http routes'))
+    expect(routes).toBeDefined()
+    await routes!.dispose()
     expect(state.routeDisposals).toBe(1)
     expect(state.runtimeDisposals).toBe(1)
   })

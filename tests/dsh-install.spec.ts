@@ -9,7 +9,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
@@ -74,7 +74,10 @@ describe('the launcher install anchor (embedded hosts)', () => {
     const anchored = writeDsh(join(tmp, 'other'), '9.9.9')
     setLauncherInstallAnchorSource(() => join(anchored, 'package.json'))
 
-    expect(dshHostInfo(join(cli, 'bin.js'))).toEqual({ version: '0.1.1-rc.2', directory: cli })
+    // The entry walk resolves symlinks, and on macOS the temp directory is
+    // reached through one (`/var` -> `/private/var`), so the expected
+    // directory is the resolved spelling — Linux CI would not have caught it.
+    expect(dshHostInfo(join(cli, 'bin.js'))).toEqual({ version: '0.1.1-rc.2', directory: realpathSync(cli) })
   })
 
   it('re-reads the source per lookup, so a launcher that publishes late still counts', () => {
