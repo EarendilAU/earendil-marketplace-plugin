@@ -240,6 +240,45 @@ export interface UpdateStatus {
     | { kind: 'npm-rename'; from: string; target: string }
 }
 
+/** Why a Host-owned drain operation is still queued (#411). */
+export interface DrainWaitWire {
+  reason: 'agents'
+  activeCount: number
+  activeAgentIds: string[]
+  since: number
+}
+
+/** One Host-owned deferred operation, as `/status` projects it. */
+export interface DrainOperationWire {
+  operationId: string
+  kind: 'install' | 'update' | 'uninstall'
+  name: string
+  url?: string
+  state: 'accepted' | 'draining' | 'queued-for-mutation' | 'running' | 'verifying' | 'succeeded' | 'failed' | 'cancelled'
+  createdAt: number
+  startedAt: number | null
+  finishedAt: number | null
+  wait: DrainWaitWire | null
+  failure: { code: string; message: string } | null
+  outcome: {
+    needsRefresh: boolean
+    restartRequired: boolean
+    activation: string | null
+    hot: boolean
+  } | null
+}
+
+/** A terminal record that outlives a Host restart (no prompt or path data). */
+export interface DrainHistoryWire {
+  at: number
+  id: string
+  kind: 'install' | 'update' | 'uninstall'
+  name: string
+  state: 'succeeded' | 'failed' | 'cancelled'
+  agentsAtStart: number
+  agentsAtEnd: number
+}
+
 /** Poll payload from /dsh-market/status. */
 export interface MarketStatus {
   /** The market's own version — rendered in the heading so screenshots carry it. */
@@ -284,6 +323,14 @@ export interface MarketStatus {
    * is empty and the operation lock is free; absent means idle.
    */
   runningAgents?: string[]
+  /** Whether this Host can hold Agents at the maintenance boundary (#411). */
+  agentDrain?: boolean
+  /** True while a deferred operation owns the mutation lane. */
+  drainActive?: boolean
+  /** Host-owned deferred operations, active first and recent terminal last. */
+  drainOperations?: DrainOperationWire[]
+  /** Terminal records from earlier Host processes (terminal journal). */
+  drainHistory?: DrainHistoryWire[]
   /**
    * The process supervisor the host detected around itself (systemd, pm2),
    * or null/absent when none. Present so the UI can explain WHY the restart

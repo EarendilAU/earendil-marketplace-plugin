@@ -10,6 +10,7 @@ import { createHash } from 'node:crypto'
 import { JSON_SCHEMA, load } from 'js-yaml'
 import { DIST_TAG, type Channel } from './channels.ts'
 import { resolveHeadCommit } from './accelerate.ts'
+import { inProbe } from './probe-context.ts'
 import { marketFetch } from './net.ts'
 import { activeRegion, githubRoutesFor, rememberGithubRoute, throughProxy, type Region } from './regions.ts'
 import type { GitToNpmMigration, NpmRenameMigration } from './source-migration.ts'
@@ -252,6 +253,10 @@ export function isUpgrade(installed: string | null, latest: string | null): bool
 
 /** Drop the cached listing (after a successful install/update/uninstall). */
 export function invalidateUpdates(): void {
+  // A drain probe runs the same no-op/stale branches, but nothing changed on
+  // disk yet; dropping the listing there would make the UI re-check releases
+  // because a request merely entered the queue.
+  if (inProbe()) return
   updatesCache = null
 }
 

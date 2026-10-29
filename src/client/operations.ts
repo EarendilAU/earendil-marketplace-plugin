@@ -42,6 +42,15 @@ export interface OperationRecord {
   url?: string
   /** Original update options survive queueing and build approval; agent consent is never persisted. */
   updateOptions?: { force?: boolean; restore?: boolean; compatVersion?: string | undefined; eligibleVersion?: string }
+  /**
+   * Set while the Host owns this operation and coordinates Agent holds
+   * (#411). These rows are never written to the client queue: the Host's
+   * record is the source of truth, and re-running the row client-side would
+   * bypass the maintenance barrier.
+   */
+  hostOperationId?: string
+  /** When the Host started waiting for a safe point (ms epoch). */
+  waitSince?: number
   state: OperationState
   /** 0-100 while running; null when the host reports no total to divide by. */
   percent?: number | null
@@ -268,6 +277,9 @@ export const SETTLED_LIMIT = 20
 export function serializeSettled(list: readonly OperationRecord[]): OperationRecord[] {
   return list
     .filter(isSettled)
+    // Host-owned rows are reconstructed from /status, not from this key; a
+    // second copy would duplicate the row after a reload.
+    .filter(record => record.hostOperationId === undefined)
     .slice(-SETTLED_LIMIT)
     .map(record => ({
       id: record.id,
@@ -320,6 +332,9 @@ function asHeldRelease(value: unknown): OperationRecord['heldRelease'] | undefin
 function restoreSettledRecord(value: unknown): OperationRecord | null {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) return null
   const row = value as Record<string, unknown>
+  // A Host-owned row lives in the Host's record; restoring it here would
+  // create a second row for the same operation.
+  if (asText(row.hostOperationId) !== undefined) return null
   const id = asText(row.id)
   const name = asText(row.name)
   const kind = row.kind === 'install' || row.kind === 'update' || row.kind === 'uninstall' ? row.kind : undefined

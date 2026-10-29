@@ -36,6 +36,9 @@ import { PendingRowJournal, repairOrphanedRows } from './pending-rows.ts'
 import { addProfileBundle, bundleExpressionRowIds, bundleOptOutRowIds, bundlePatchInsertedIds, bundlesDroppedFromProfile, declareProfileDependency, dropFromManifest, generationManagedNames, hasLoadableEntry, holdsNativeAddon, INBOX_BUNDLES, isDshProfileName, profileDir, readDependencyOwners, readGitResolutionCommit, readInstalled, readInstalledManifest, readInstalledPackageName, readInstalledRepoEvidence, readInstalledVersion, readLockCommits, readProfileBundles, readProfileManifestSnapshot, removeProfileBundle, parsePatchRows, restoreProfileManifest, setAllowBuilds, shippedInsertedRowIds, type ProfileManifestSnapshot } from './profile.ts'
 import { assessProfile, classifyPeer, introducedDuplicateNames, introducedRisks, type CompatibilityRisk } from './compatibility.ts'
 import { runningAgentIds, type AgentsLookup } from './agents.ts'
+import { DrainCoordinator, DrainNoop, DrainRefusal, type DrainExecutionResult, type DrainIntent, type DrainMutationGate } from './drain.ts'
+import { DrainJournal } from './drain-journal.ts'
+import { inProbe, runInProbe } from './probe-context.ts'
 import { analyzeProfile, corePackageNames, type DuplicateName } from './check.ts'
 import { applyBundleOrder, mergeOrder, readBundleRules, readBundleStack, validateOrder } from './order.ts'
 import { applyPreset, deletePreset, listPresets, previewPreset, savePreset } from './presets.ts'
@@ -111,7 +114,7 @@ export interface MarketHost {
   webServer: WebServerService
   loader: { entries(): Iterable<LoaderEntry> }
   plugin(plugin: unknown, config: unknown): { await(): Promise<unknown>; dispose(): Promise<unknown> | void }
-  on?(event: string, callback: (fiber: { entry?: { options?: { name?: string } } }) => void): () => void
+  on?(event: string, callback: (payload: unknown) => void): () => void
   logger?: { info?(message: string): void; warn(message: string): void }
 }
 
@@ -561,6 +564,56 @@ export function mountMarketRoutes(
   // re-applies the same choice on every boot (ported from dsh-plugin-hub).
   const userPatchPath = findUserPatchPath(host, activeProfileDir)
   const commands: PluginCommandRuntime = commandRuntime ?? { runPlugin: runDshPlugin, probePnpm, provisionPnpm, cancelActive }
+
+  /**
+   * Internal roles for one in-memory replay of a mutating route.
+   *
+   * `probe` runs the route's ordinary validation only, ending at the boundary
+   * just before the first destructive step; it must not mutate anything.
+   * `execute` runs that same route for real. The role lives on the replay
+   * request object, so a public request can never claim either role.
+   */
+  type DrainCall =
+    | { role: 'probe'; onIntent: (intent: DrainIntent) => void }
+    | { role: 'execute'; expected: DrainIntent | null; onPhase?: (phase: 'verifying') => void }
+  const drainCalls = new WeakMap<IncomingMessage, DrainCall>()
+  const drainCallOf = (request: IncomingMessage): DrainCall | undefined => drainCalls.get(request)
+  const drainPhaseOf = (request: IncomingMessage): ((phase: 'verifying') => void) | undefined => {
+    const call = drainCallOf(request)
+    return call?.role === 'execute' ? call.onPhase : undefined
+  }
+
+  const agentFromEvent = (payload: unknown): unknown => {
+    if (payload === null || typeof payload !== 'object') return undefined
+    return (payload as { agent?: unknown }).agent
+  }
+  const drainJournal = new DrainJournal(join(activeProfileDir, '.dsh-market', 'drain.ndjson'))
+  const drainCoordinator = new DrainCoordinator({
+    host: {
+      list: () => {
+        const service = agentsLookup?.()
+        if (service === undefined) return null
+        try {
+          const listed = service.list()
+          return Array.isArray(listed) ? listed : null
+        } catch {
+          return null
+        }
+      },
+      onCreated: listener => host.on?.('agent/created', payload => {
+        const agent = agentFromEvent(payload)
+        if (agent !== undefined) listener(agent)
+      }) ?? null,
+      onDisposed: listener => host.on?.('agent/disposed', payload => {
+        const agent = agentFromEvent(payload)
+        if (agent !== undefined) listener(agent)
+      }) ?? null,
+    },
+    journal: drainJournal,
+    bootId: BOOT_ID,
+    log: (level, event, detail) => logEvent(level, event, detail),
+    abortMutation: () => commands.cancelActive(),
+  })
   /**
    * Whether this host runs pnpm itself and so takes the market's own options
    * (`--config.*`, `--force`, `--no-frozen-lockfile`).
@@ -812,7 +865,8 @@ export function mountMarketRoutes(
   // Self-healing guard: dsh's own patch overlay can re-update entries during
   // activation and wipe the runtime disabled flag — whenever a fiber comes
   // up for a plugin the user switched off, put it back down.
-  host.on?.('internal/plugin', (fiber) => {
+  host.on?.('internal/plugin', (payload) => {
+    const fiber = payload as { entry?: { options?: { name?: string } } }
     const name = fiber.entry?.options?.name
     if (name !== undefined && disabled.has(name) && !followOutsideEnable(name)) void themes.setEntryDisabled(name, true)
   })
@@ -824,6 +878,8 @@ export function mountMarketRoutes(
   // interleaved awaits, and a second mutating request answers 409
   // immediately instead of queueing (issue #125 review).
   let writing = false
+  /** Routes currently running a drain probe; `/status.busy` covers them. */
+  let preflightActive = 0
   let mutationBusy = false
   /** The shared mutation chain: every mutating operation appends to it. */
   let mutationChain: Promise<unknown> = Promise.resolve()
@@ -839,6 +895,45 @@ export function mountMarketRoutes(
     return await run
   }
 
+  /** Answer a drain gate that says the profile must not be touched. */
+  const sendDrainGate = (response: ServerResponse, gate: DrainMutationGate): void => {
+    if (gate.ok) return
+    if (gate.reason === 'cancelled') {
+      // The user's cancel wins even when the executor had already returned a
+      // success; the client treats `cancelled` as a quiet reset.
+      sendJson(response, 200, { ok: false, cancelled: true })
+      return
+    }
+    if (gate.reason === 'market-unloaded') {
+      sendJson(response, 503, {
+        ok: false,
+        failureCode: 'MARKET_UNLOADED',
+        error: '市场正在卸载，这次没有改任何文件。 / The market is unloading; nothing was changed.',
+      })
+      return
+    }
+    sendJson(response, 409, {
+      ok: false,
+      failureCode: 'AGENT_BARRIER_LOST',
+      ...(gate.ids.length === 0 ? {} : { runningAgents: gate.ids }),
+      error: '有 Agent 在文件变更前恢复了活动，这次没有改任何文件。 / An Agent became active before the file change; nothing was changed.',
+    })
+  }
+
+  /**
+   * The executor's pre-command gate: called immediately before every
+   * `runPlugin` in the three package routes, including retry and fallback
+   * paths. A drain replay that cannot still hold every Agent answers here
+   * instead of starting pnpm.
+   */
+  const assertDrainMutation = (request: IncomingMessage, response: ServerResponse): boolean => {
+    if (drainCallOf(request)?.role !== 'execute') return true
+    const gate = drainCoordinator.assertCanMutate()
+    if (gate.ok) return true
+    sendDrainGate(response, gate)
+    return false
+  }
+
   /**
    * Run a mutating operation under the shared mutation lock. `kind` selects
    * the UI busy flag (`install` = pnpm operation, `write` = direct profile
@@ -852,9 +947,28 @@ export function mountMarketRoutes(
     response: ServerResponse,
     kind: 'install' | 'write',
     fn: () => Promise<T> | T,
+    request?: IncomingMessage,
   ): Promise<T | null> {
-    if (mutationBusy) {
+    const drainCall = request === undefined ? undefined : drainCallOf(request)
+    // A probe runs the ordinary validation without touching the mutation
+    // lane: it will not mutate, and the operator it is probing for has not
+    // been accepted yet. It still reports `/status.busy`: a registry or Git
+    // resolution can take seconds, and an idle-looking Host would let the
+    // client declare the install dead and send a second request.
+    if (drainCall?.role === 'probe') {
+      preflightActive += 1
+      try {
+        return await fn()
+      } finally {
+        preflightActive -= 1
+      }
+    }
+    const drainReserved = drainCoordinator.hasActive() && drainCall?.role !== 'execute'
+    if (mutationBusy || drainReserved) {
       sendJson(response, 409, {
+        // The long-standing lock response stays byte-identical for ordinary
+        // contention; the drain reservation is the one callers can tell apart.
+        ...(drainReserved ? { failureCode: 'OPERATION_BUSY' } : {}),
         error: kind === 'install' ? 'another install is already running' : 'another plugin operation is running',
       })
       return null
@@ -863,6 +977,17 @@ export function mountMarketRoutes(
     if (kind === 'install') installing = true
     else writing = true
     try {
+      // FR-5: the lock is the serialization boundary, not the admission
+      // barrier. Re-enumerate once more while holding it, before the executor
+      // can start, so an Agent created without a delivered event is either
+      // claimed now or stops the operation with no file change.
+      if (drainCall?.role === 'execute') {
+        const gate = drainCoordinator.assertCanMutate()
+        if (!gate.ok) {
+          sendDrainGate(response, gate)
+          return null
+        }
+      }
       const run = mutationChain.then(async () => fn())
       mutationChain = run.catch(() => undefined)
       return await run
@@ -2074,6 +2199,7 @@ export function mountMarketRoutes(
     method: 'GET' | 'POST',
     body?: unknown,
     url = path,
+    options?: { drainCall?: DrainCall },
   ): Promise<{ status: number; payload: unknown }> {
     const handler = legacyHandlers.get(path)
     if (handler === undefined) throw new Error(`legacy route is unavailable: ${path}`)
@@ -2085,6 +2211,7 @@ export function mountMarketRoutes(
       headers: { ...source.headers },
       socket: source.socket,
     })
+    if (options?.drainCall !== undefined) drainCalls.set(replay, options.drainCall)
     let status = 200
     let text = ''
     const captured = {
@@ -2098,6 +2225,162 @@ export function mountMarketRoutes(
     let payload: unknown = null
     try { payload = text === '' ? null : JSON.parse(text) as unknown } catch { payload = { error: text } }
     return { status, payload }
+  }
+
+  const drainPathOf = (kind: DrainIntent['kind']): string =>
+    kind === 'install' ? '/dsh-market/install' : kind === 'update' ? '/dsh-market/update' : '/dsh-market/uninstall'
+
+  const withoutBusyPolicy = (body: Record<string, unknown>): Record<string, unknown> => {
+    const { busyPolicy: _busyPolicy, ...rest } = body
+    return rest
+  }
+
+  /** Whether the executor still sees the exact facts the user approved. */
+  const drainIntentMatches = (expected: DrainIntent, actual: DrainIntent): boolean => {
+    if (expected.kind !== actual.kind) return false
+    if (expected.expected.target !== undefined && expected.expected.target !== actual.expected.target) return false
+    if (expected.expected.spec !== undefined && expected.expected.spec !== actual.expected.spec) return false
+    if (expected.expected.version !== undefined && expected.expected.version !== actual.expected.version) return false
+    return true
+  }
+
+  /**
+   * Pin a GitHub shortcut to its current commit when the region has no proxy.
+   *
+   * `acceleratedTarget` deliberately leaves global installs to pnpm, but a
+   * deferred drain operation must name one immutable artifact. Without this, a
+   * bare `github:owner/repo` (and a `#path:` selector) could never satisfy the
+   * exact-target gate in the global region.
+   */
+  const pinDrainGithubTarget = async (target: string, region: Region): Promise<string> => {
+    if (githubCommitOfTarget(target) !== null) return target
+    const match = /^github:([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)/.exec(target)
+    if (match === null) return target
+    const sha = await resolveHeadCommit(match[1]!, region)
+    if (sha === null) return target
+    return githubTargetAtCommit(target, sha) ?? target
+  }
+
+  /**
+   * Run the route's ordinary validation without mutating anything, and keep
+   * the target it resolved. The probe body asks the agent guard to stand
+   * aside: drain mode is exactly what is going to wait for those Agents.
+   */
+  const captureDrainIntent = async (
+    request: IncomingMessage,
+    body: Record<string, unknown>,
+    path: string,
+  ): Promise<DrainIntent> => {
+    let captured: DrainIntent | null = null
+    const result = await runInProbe(() => invokeLegacy(path, request, 'POST', {
+      ...withoutBusyPolicy(body),
+      confirmAgentsRunning: true,
+    }, path, {
+      drainCall: { role: 'probe', onIntent: intent => { captured = intent } },
+    }))
+    if (captured === null) {
+      // A successful route answer with no boundary intent is the ordinary
+      // no-op (`skipped: "current"`), not a refusal. Keep that result.
+      if (result.status >= 200 && result.status < 300) throw new DrainNoop(result.status, result.payload)
+      throw new DrainRefusal(result.status, result.payload)
+    }
+    return captured
+  }
+
+  /**
+   * Re-run the route for real under the mutation lane. The expected intent is
+   * checked at the same boundary the probe captured it; a changed registry
+   * target or installed baseline stops with `targetChanged` before pnpm.
+   */
+  const executeDrain = async (
+    kind: DrainIntent['kind'],
+    request: IncomingMessage,
+    body: Record<string, unknown>,
+    intent: DrainIntent | null,
+    onPhase: (phase: 'verifying') => void,
+  ): Promise<DrainExecutionResult> => {
+    const replayBody: Record<string, unknown> = {
+      ...withoutBusyPolicy(body),
+      confirmAgentsRunning: true,
+    }
+    const path = drainPathOf(kind)
+    return await invokeLegacy(path, request, 'POST', replayBody, path, {
+      drainCall: { role: 'execute', expected: intent, onPhase },
+    })
+  }
+
+  const drainUnsupported = (response: ServerResponse, detail: string): void => {
+    sendJson(response, 400, {
+      ok: false,
+      unsupported: true,
+      failureCode: 'AGENT_DRAIN_UNSUPPORTED',
+      error: `${detail} / This host cannot safely wait for running Agents, so nothing was changed.`,
+    })
+  }
+
+  const drainBusy = (response: ServerResponse): void => {
+    sendJson(response, 409, {
+      ok: false,
+      busy: true,
+      failureCode: 'OPERATION_BUSY',
+      error: '另一个插件操作正在等待或运行，未执行任何修改。 / Another plugin operation is already waiting or running; nothing was changed.',
+    })
+  }
+
+  /** Shared entry point for `busyPolicy: "drain"` in the three package routes. */
+  const handleDrainRequest = async (
+    response: ServerResponse,
+    request: IncomingMessage,
+    kind: DrainIntent['kind'],
+    body: Record<string, unknown>,
+    name: string,
+    url?: string,
+  ): Promise<void> => {
+    const support = drainCoordinator.support()
+    if (!support.supported) {
+      drainUnsupported(response, `这个宿主不支持等待 Agent 空闲（${support.reason}）`)
+      return
+    }
+    if (drainCoordinator.hasActive() || mutationBusy) {
+      drainBusy(response)
+      return
+    }
+    const result = await drainCoordinator.begin({
+      kind,
+      name,
+      ...(url === undefined ? {} : { url }),
+      captureIntent: () => captureDrainIntent(request, body, drainPathOf(kind)),
+      execute: (intent, onPhase) => executeDrain(kind, request, body, intent, onPhase),
+    })
+    if (result.mode === 'inline') {
+      sendJson(response, result.result.status, result.result.payload)
+      return
+    }
+    if (result.mode === 'deferred') {
+      sendJson(response, 202, {
+        ok: true,
+        accepted: true,
+        operationId: result.operation.operationId,
+        operation: result.operation,
+      })
+      return
+    }
+    if (result.mode === 'terminal') {
+      // The operation ended before it could be deferred (cancelled during the
+      // probe, or the inventory became unreadable). Do not answer 202 for a
+      // task the client would render as still waiting.
+      sendJson(response, result.status, result.payload)
+      return
+    }
+    if (result.mode === 'refused') {
+      sendJson(response, result.status, result.payload)
+      return
+    }
+    if (result.mode === 'busy') {
+      drainBusy(response)
+      return
+    }
+    drainUnsupported(response, `这个宿主不支持等待 Agent 空闲（${result.reason}）`)
   }
 
   const packageNameFrom = (request: IncomingMessage): string => {
@@ -2310,7 +2593,11 @@ export function mountMarketRoutes(
             // renders an update badge has to know the aggregate exists
             // without probing for it (#602).
             updatesSummary: true,
+            // Whether this host can put live Agents under a maintenance hold
+            // while a deferred mutation waits for a safe boundary (#411).
+            agentDrain: drainCoordinator.support().supported,
           },
+          busyPolicies: ['reject', 'drain'],
           restart: {
             supported: canRestart,
             managedBy: canRestart ? 'market' : config.desktopHost === true ? 'desktop-host' : 'operator',
@@ -2423,13 +2710,13 @@ export function mountMarketRoutes(
           return
         }
         try {
-          const body = (await readJsonBody(request)) as { packageName?: unknown; force?: unknown }
+          const body = (await readJsonBody(request)) as { packageName?: unknown; force?: unknown; busyPolicy?: unknown }
           const packageName = typeof body.packageName === 'string' ? body.packageName : ''
           if (!NPM_NAME_RE.test(packageName)) {
             sendJson(response, 400, { schema: UPDATE_API_V1_SCHEMA, error: 'a valid package name is required' })
             return
           }
-          if (operationsV1.hasActive()) {
+          if (operationsV1.hasActive() || drainCoordinator.hasActive() || mutationBusy) {
             sendJson(response, 409, {
               schema: UPDATE_API_V1_SCHEMA,
               error: 'another public update operation is already running',
@@ -2451,6 +2738,164 @@ export function mountMarketRoutes(
                 message: 'plugin is not installed in this profile',
                 retryable: false,
               },
+            })
+            return
+          }
+          if (body.busyPolicy === 'drain') {
+            const support = drainCoordinator.support()
+            if (!support.supported) {
+              sendJson(response, 400, {
+                schema: UPDATE_API_V1_SCHEMA,
+                error: `agent drain is unavailable on this host (${support.reason})`,
+                failure: {
+                  code: 'AGENT_DRAIN_UNSUPPORTED',
+                  message: `agent drain is unavailable on this host (${support.reason})`,
+                  retryable: false,
+                },
+              })
+              return
+            }
+            const replayBody: Record<string, unknown> = {
+              name: packageName,
+              ...(body.force === true ? { force: true } : {}),
+            }
+            let intent: DrainIntent
+            try {
+              intent = await captureDrainIntent(request, replayBody, '/dsh-market/update')
+            } catch (error) {
+              if (error instanceof DrainNoop) {
+                const noop = (error.payload !== null && typeof error.payload === 'object' && !Array.isArray(error.payload))
+                  ? error.payload as Record<string, unknown>
+                  : {}
+                sendJson(response, error.status, { schema: UPDATE_API_V1_SCHEMA, ...noop })
+                return
+              }
+              if (!(error instanceof DrainRefusal)) throw error
+              const refused = (error.payload !== null && typeof error.payload === 'object')
+                ? error.payload as Record<string, unknown>
+                : {}
+              const message = typeof refused.error === 'string' ? refused.error : 'the update was refused before it could be deferred'
+              const code = refused.targetChanged === true ? 'TARGET_CHANGED' : 'UPDATE_REJECTED'
+              sendJson(response, error.status, {
+                schema: UPDATE_API_V1_SCHEMA,
+                error: message,
+                failure: { code, message, retryable: code === 'TARGET_CHANGED' },
+              })
+              return
+            }
+            const operation = operationsV1.create(packageName, installedVersion)
+            let finished = false
+            const finishPublic = (status: number, payload: unknown): void => {
+              operationsV1.finish(
+                operation.operationId,
+                status,
+                payload,
+                readInstalledVersion(config.profile, packageName, activeProfileDir),
+              )
+              finished = true
+            }
+            const begin = await drainCoordinator.begin({
+              kind: 'update',
+              name: packageName,
+              forceDeferred: true,
+              captureIntent: async () => intent,
+              execute: async (planned, onPhase) => {
+                const result = await executeDrain('update', request, replayBody, planned, onPhase)
+                finishPublic(result.status, result.payload)
+                return result
+              },
+              onUpdate: view => {
+                if (view.wait !== null) operationsV1.setWait(operation.operationId, view.wait)
+                if (view.state === 'running') operationsV1.start(operation.operationId)
+                if (view.state === 'verifying') operationsV1.beginVerifying(operation.operationId)
+                if (view.state === 'succeeded' || view.state === 'failed' || view.state === 'cancelled') {
+                  if (view.state === 'failed' && view.failure?.code === 'AGENT_BARRIER_LOST') {
+                    finishPublic(409, {
+                      ok: false,
+                      failureCode: 'AGENT_BARRIER_LOST',
+                      error: view.failure.message,
+                    })
+                    return
+                  }
+                  if (view.state === 'cancelled') {
+                    // A cancel or unload that landed after the executor
+                    // returned success still owns the final state.
+                    finishPublic(200, { ok: false, cancelled: true })
+                    return
+                  }
+                  if (finished) return
+                  {
+                    finishPublic(500, {
+                      ok: false,
+                      error: view.failure?.message ?? 'the deferred update failed',
+                      ...(view.failure?.code === undefined ? {} : { failureCode: view.failure.code }),
+                      ...(view.failure?.code === 'TARGET_CHANGED' ? { targetChanged: true } : {}),
+                    })
+                  }
+                }
+              },
+            })
+            if (begin.mode === 'deferred') {
+              sendJson(response, 202, {
+                schema: UPDATE_API_V1_SCHEMA,
+                operation: operationsV1.get(operation.operationId),
+              })
+              return
+            }
+            if (begin.mode === 'terminal') {
+              finishPublic(begin.status, begin.payload)
+              if (begin.status >= 200 && begin.status < 300) {
+                sendJson(response, 200, {
+                  schema: UPDATE_API_V1_SCHEMA,
+                  operation: operationsV1.get(operation.operationId),
+                })
+              } else {
+                const error = begin.operation.failure?.message ?? 'the deferred update did not start'
+                sendJson(response, begin.status, {
+                  schema: UPDATE_API_V1_SCHEMA,
+                  error,
+                  failure: {
+                    code: begin.operation.failure?.code ?? 'UPDATE_FAILED',
+                    message: error,
+                    retryable: true,
+                  },
+                })
+              }
+              return
+            }
+            if (begin.mode === 'busy') {
+              finishPublic(409, { ok: false, busy: true, error: 'another plugin operation is already waiting or running' })
+              sendJson(response, 409, {
+                schema: UPDATE_API_V1_SCHEMA,
+                error: 'another plugin operation is already waiting or running',
+                failure: { code: 'OPERATION_BUSY', message: 'another plugin operation is already waiting or running', retryable: true },
+              })
+              return
+            }
+            if (begin.mode === 'unsupported') {
+              finishPublic(400, { ok: false, error: `agent drain is unavailable on this host (${begin.reason})` })
+              sendJson(response, 400, {
+                schema: UPDATE_API_V1_SCHEMA,
+                error: `agent drain is unavailable on this host (${begin.reason})`,
+                failure: { code: 'AGENT_DRAIN_UNSUPPORTED', message: `agent drain is unavailable on this host (${begin.reason})`, retryable: false },
+              })
+              return
+            }
+            if (begin.mode === 'refused') {
+              finishPublic(begin.status, begin.payload)
+              sendJson(response, begin.status, {
+                schema: UPDATE_API_V1_SCHEMA,
+                error: 'the deferred update was refused',
+                failure: { code: 'UPDATE_REJECTED', message: 'the deferred update was refused', retryable: false },
+              })
+              return
+            }
+            // `forceDeferred` never chooses the inline path; keep the response
+            // shape honest if that ever changes.
+            finishPublic(begin.result.status, begin.result.payload)
+            sendJson(response, begin.result.status, {
+              schema: UPDATE_API_V1_SCHEMA,
+              operation: operationsV1.get(operation.operationId),
             })
             return
           }
@@ -3944,12 +4389,19 @@ export function mountMarketRoutes(
           // exits, install post-processing (retarget, validation, hot-mount)
           // still holds the operation lock for a moment — the exact window
           // where clicking the restart banner used to bounce off a 409 (#91).
-          busy: installing,
+          busy: installing || preflightActive > 0,
           // Queue drain signal for the client's install queue: the agent-file
           // guard values are already computed for every status poll, so the
           // client can decide when a queued operation may run without an
           // extra round trip. Absent ([]) means agents are idle.
           runningAgents: runningAgentsForGuard(),
+          // Host-owned drain mode (#411). `agentDrain` is per request: a host
+          // whose live Agent handles lack the maintenance boundary, or that
+          // cannot report Agent creation, must keep the 409 fallback.
+          agentDrain: drainCoordinator.support().supported,
+          drainActive: drainCoordinator.hasActive(),
+          drainOperations: drainCoordinator.list(),
+          drainHistory: drainJournal.recent(10),
           pnpm: await commands.probePnpm(),
           boot: BOOT_ID,
           agentGuardAvailable: agentsGuardAvailable(),
@@ -4516,9 +4968,31 @@ sendJson(response, 200, { updates })
           return
         }
         try {
+          const body = (await readJsonBody(request)) as {
+            name?: unknown
+            force?: unknown
+            restore?: unknown
+            compatVersion?: unknown
+            eligibleVersion?: unknown
+            confirmAgentsRunning?: unknown
+            busyPolicy?: unknown
+          }
+          const name = typeof body.name === 'string' ? body.name : ''
+          const drainCall = drainCallOf(request)
+          if (drainCall === undefined && body.busyPolicy === 'drain') {
+            if (body.restore === true) {
+              sendJson(response, 400, {
+                ok: false,
+                unsupported: true,
+                failureCode: 'AGENT_DRAIN_UNSUPPORTED',
+                error: '从本地开发恢复不会走等待 Agent 的流程，请等 Session 结束后再试。 / Restoring a local development install does not use drain mode; try again after the running sessions finish.',
+              })
+              return
+            }
+            await handleDrainRequest(response, request, 'update', body as Record<string, unknown>, name)
+            return
+          }
           await withMutationLock(response, 'install', async () => {
-            const body = (await readJsonBody(request)) as { name?: unknown; force?: unknown; restore?: unknown; compatVersion?: unknown; eligibleVersion?: unknown; confirmAgentsRunning?: unknown }
-            const name = typeof body.name === 'string' ? body.name : ''
             const force = body.force === true
             // A release the refusal dialog's own search confirmed compatible
             // (#581). Pinned below instead of resolving `latest` again —
@@ -4917,13 +5391,16 @@ sendJson(response, 200, { updates })
             // `github:owner/repo` untouched, so passing a restore through it
             // still gets a China-region mirror where one applies and changes
             // nothing where one does not.
-            const target = restore
+            let target = restore
               ? (NPM_NAME_RE.test(spec) ? `${spec}@${tag}` : await acceleratedTarget(spec, region))
               : usesNpmUpdateTarget
                 ? (expectedNpmVersion !== null ? `${name}@${expectedNpmVersion}` : `${name}@${tag}`)
                 : genericGitTarget !== null
                   ? genericGitTarget
                   : await acceleratedTarget(gitSpec!, region)
+            if (drainCall !== undefined && (drainCall.role === 'probe' || drainCall.expected !== null)) {
+              target = await pinDrainGithubTarget(target, region)
+            }
             const repoIdentity = isGit ? repoOfTarget(spec) : null
             const repoKey = repoIdentity?.split('#')[0] ?? null
             // A non-GitHub remote (#632) has no repo key. Its identity is the
@@ -4998,6 +5475,44 @@ sendJson(response, 200, { updates })
             const addArgs = inPlaceUpdate
               ? (force ? ['update', RELEASE_AGE_OVERRIDE, name] : ['update', name])
               : (force && marketFlags && config.desktopHost !== true ? ['add', RELEASE_AGE_OVERRIDE, target] : ['add', target])
+            if (drainCall !== undefined) {
+              // Only a deferred operation needs an immutable target. An inline
+              // drain runs now, with the ordinary route's tolerance for an
+              // unpinned registry answer.
+              if (drainCall.role === 'probe' || drainCall.expected !== null) {
+                const exact = restore
+                  ? false
+                  : usesNpmUpdateTarget
+                    ? expectedNpmVersion !== null
+                    : /^https?:/i.test(target)
+                      || githubCommitOfTarget(target) !== null
+                      || gitCommitOfTarget(target) !== null
+                if (!exact) {
+                  sendJson(response, 409, {
+                    targetChanged: true,
+                    error: '无法确认这次要更新的精确版本，因此不会在等待后执行。请刷新市场后重新选择。 / The exact update target could not be verified, so it will not run after waiting. Refresh the market and choose again.',
+                  })
+                  return
+                }
+              }
+              const intent: DrainIntent = {
+                kind: 'update',
+                name,
+                expected: { target, spec, version: beforeVersion },
+              }
+              if (drainCall.role === 'probe') {
+                drainCall.onIntent(intent)
+                sendJson(response, 200, { ok: true, drainPreflight: true })
+                return
+              }
+              if (drainCall.expected !== null && !drainIntentMatches(drainCall.expected, intent)) {
+                sendJson(response, 409, {
+                  targetChanged: true,
+                  error: '等待期间更新目标或已装版本变了，没有执行更新。请刷新后重新选择。 / The update target or the installed version changed while waiting; nothing was updated. Refresh and choose again.',
+                })
+                return
+              }
+            }
             // Exact manifest snapshot for failure rollback (#65, #339) — the
             // host can write dependencies AND dsh.profile.bundles before a
             // hard-failed add, leaving residue that breaks the next boot.
@@ -5168,7 +5683,9 @@ sendJson(response, 200, { updates })
             // Even when a candidate was mature during validation, pnpm may
             // reject the operation because another lockfile entry is young or
             // the registry changes. Never retry this update with an age bypass.
+            if (!assertDrainMutation(request, response)) return
             const result = await (enforceMatureReleaseAge ? runMaturePluginUpdate : runPlugin)(config.profile, addArgs)
+            drainPhaseOf(request)?.('verifying')
             const cancelled = result.cancelled
             // The pin above is the market's own write, so it is undone whenever
             // pnpm did not replace it. Measured on pnpm 11.7.0 and 12.4.1, a
@@ -5790,10 +6307,10 @@ sendJson(response, 200, { updates })
               stderr: result.stderr,
               installed: readInstalled(config.profile, activeProfileDir),
             })
-          })
+          }, request)
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error)
-          host.logger?.warn(`[dsh-market] update failed: ${message}`)
+          if (!inProbe()) host.logger?.warn(`[dsh-market] update failed: ${message}`)
           logEvent('error', 'update', `route error: ${message}`)
           sendJson(response, 500, { error: message })
         }
@@ -6510,6 +7027,22 @@ sendJson(response, 200, { updates })
           sendJson(response, 403, { error: 'untrusted origin' })
           return
         }
+        let operationId = ''
+        try {
+          const body = await readJsonBody(request) as { operationId?: unknown }
+          if (typeof body.operationId === 'string') operationId = body.operationId
+        } catch {
+          // The existing cancel-active callers post an empty body.
+        }
+        if (operationId !== '') {
+          if (!drainCoordinator.cancel(operationId)) {
+            sendJson(response, 400, { error: 'no deferred operation with that id' })
+            return
+          }
+          logEvent('info', 'cancel', `cancelled deferred ${operationId}`)
+          sendJson(response, 200, { ok: true, cancelled: true, operationId })
+          return
+        }
         // Cancel flow contributed in #6 by @qichuang321.
         if (!commands.cancelActive()) {
           sendJson(response, 400, { error: 'no operation is running' })
@@ -6520,7 +7053,7 @@ sendJson(response, 200, { updates })
       },
     }),
 
-    registerRoute({
+    registerRoute(captureLegacy('/dsh-market/uninstall', {
       kind: 'exact',
       path: '/dsh-market/uninstall',
       handler: async (request, response) => {
@@ -6534,9 +7067,18 @@ sendJson(response, 200, { updates })
           return
         }
         try {
+          const body = (await readJsonBody(request)) as {
+            name?: unknown
+            force?: unknown
+            confirmAgentsRunning?: unknown
+            busyPolicy?: unknown
+          }
+          const name = typeof body.name === 'string' ? body.name : ''
+          if (drainCallOf(request) === undefined && body.busyPolicy === 'drain') {
+            await handleDrainRequest(response, request, 'uninstall', body as Record<string, unknown>, name)
+            return
+          }
           await withMutationLock(response, 'install', async () => {
-            const body = (await readJsonBody(request)) as { name?: unknown; force?: unknown; confirmAgentsRunning?: unknown }
-            const name = typeof body.name === 'string' ? body.name : ''
             // Only the INDETERMINATE patch case is forceable, below. A patch
             // that definitely names the package stays refused: there the user
             // has a concrete thing to go fix, so an override would only help
@@ -6596,6 +7138,31 @@ sendJson(response, 200, { updates })
               })
               return
             }
+            const drainCall = drainCallOf(request)
+            if (drainCall !== undefined) {
+              const installedSpec = readInstalled(config.profile, activeProfileDir)[name]
+              if (installedSpec === undefined) {
+                sendJson(response, 400, { error: 'plugin is not installed' })
+                return
+              }
+              const intent: DrainIntent = {
+                kind: 'uninstall',
+                name,
+                expected: { spec: installedSpec, version: readInstalledVersion(config.profile, name, activeProfileDir) },
+              }
+              if (drainCall.role === 'probe') {
+                drainCall.onIntent(intent)
+                sendJson(response, 200, { ok: true, drainPreflight: true })
+                return
+              }
+              if (drainCall.expected !== null && !drainIntentMatches(drainCall.expected, intent)) {
+                sendJson(response, 409, {
+                  targetChanged: true,
+                  error: '等待期间这个插件的已装版本变了，没有执行卸载。请刷新后重新确认。 / The installed version changed while waiting; nothing was uninstalled. Refresh and confirm again.',
+                })
+                return
+              }
+            }
             pendingRollbacks.clear()
             const beforeInstalled = readInstalled(config.profile, activeProfileDir)
             // isDisabled comes from the patch layer (#130) — keep it while the
@@ -6633,7 +7200,9 @@ sendJson(response, 200, { updates })
             // package that is no longer installed.
             const rowJournal = PendingRowJournal.forProfile(activeProfileDir)
             rowJournal.begin({ profile: config.profile, name, patchPath: userPatchPath, rows: ownedRows })
+            if (!assertDrainMutation(request, response)) return
             const result = await runPlugin(config.profile, ['remove', name])
+            drainPhaseOf(request)?.('verifying')
             const cancelled = result.cancelled
             let ok = result.exitCode === 0 && !result.timedOut && !cancelled
             const cancelDiff = cancelled ? changedSince(beforeInstalled) : null
@@ -6747,15 +7316,15 @@ sendJson(response, 200, { updates })
               stderr: result.stderr,
               installed: readInstalled(config.profile, activeProfileDir),
             })
-          })
+          }, request)
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error)
-          host.logger?.warn(`[dsh-market] uninstall failed: ${message}`)
+          if (!inProbe()) host.logger?.warn(`[dsh-market] uninstall failed: ${message}`)
           logEvent('error', 'uninstall', `route error: ${message}`)
           sendJson(response, 500, { error: message })
         }
       },
-    }),
+    })),
 
     registerRoute(captureLegacy('/dsh-market/rollback', {
       kind: 'exact',
@@ -6836,7 +7405,7 @@ sendJson(response, 200, { updates })
       },
     })),
 
-    registerRoute({
+    registerRoute(captureLegacy('/dsh-market/install', {
       kind: 'exact',
       path: '/dsh-market/install',
       handler: async (request, response) => {
@@ -6850,8 +7419,26 @@ sendJson(response, 200, { updates })
           return
         }
         try {
+          const body = (await readJsonBody(request)) as {
+            url?: unknown
+            force?: unknown
+            version?: unknown
+            busyPolicy?: unknown
+          }
+          const drainCall = drainCallOf(request)
+          if (drainCall === undefined && body.busyPolicy === 'drain') {
+            const requestedUrl = typeof body.url === 'string' ? body.url : ''
+            await handleDrainRequest(
+              response,
+              request,
+              'install',
+              body as Record<string, unknown>,
+              requestedUrl === '' ? 'install' : requestedUrl,
+              requestedUrl === '' ? undefined : requestedUrl,
+            )
+            return
+          }
           await withMutationLock(response, 'install', async () => {
-            const body = (await readJsonBody(request)) as { url?: unknown; force?: unknown; version?: unknown }
             const force = body.force === true
             const url = typeof body.url === 'string' ? body.url : ''
             // A release the user picked from the refusal dialog's own search
@@ -6907,6 +7494,12 @@ sendJson(response, 200, { updates })
             let target = await acceleratedTarget(pinnedTarget, region)
             if (target !== pinnedTarget) {
               logEvent('info', 'region', `${entry.name}: resolved HEAD through an available ${region} route; downloading the commit-pinned GitHub target directly for pnpm integrity`)
+            }
+            // The global region has no proxy, so `acceleratedTarget` leaves a
+            // bare `github:` shortcut to pnpm. A deferred drain operation
+            // still needs the commit it was approved against.
+            if (drainCall !== undefined && (drainCall.role === 'probe' || drainCall.expected !== null)) {
+              target = await pinDrainGithubTarget(target, region)
             }
             // Duplicate guard (#27): the same plugin listed under another name
             // (an alias entry pointing at the same repo) must never install
@@ -7016,6 +7609,39 @@ sendJson(response, 200, { updates })
             const beforeSpecs = readInstalled(config.profile, activeProfileDir)
             const before = new Set(Object.keys(beforeSpecs))
             if (retryAlias !== null) before.delete(retryAlias)
+            if (drainCall !== undefined) {
+              // Only a deferred operation needs an immutable target. The
+              // inline path runs immediately, exactly like an ordinary
+              // install, so a registry that cannot pin a version must not
+              // turn into a refusal there.
+              if (drainCall.role === 'probe' || drainCall.expected !== null) {
+                const exact = NPM_NAME_RE.test(plainTarget)
+                  ? requestedVersion !== null || registryLatest !== null
+                  : /^https?:|^file:/i.test(target)
+                    || githubCommitOfTarget(target) !== null
+                    || gitCommitOfTarget(target) !== null
+                if (!exact) {
+                  sendJson(response, 409, {
+                    targetChanged: true,
+                    error: '无法确认这次要装的精确版本，因此不会在等待后执行。请刷新市场后重新选择。 / The exact release could not be verified, so it will not run after waiting. Refresh the market and choose again.',
+                  })
+                  return
+                }
+              }
+              const intent: DrainIntent = { kind: 'install', name: entry.name, url, expected: { target } }
+              if (drainCall.role === 'probe') {
+                drainCall.onIntent(intent)
+                sendJson(response, 200, { ok: true, drainPreflight: true })
+                return
+              }
+              if (drainCall.expected !== null && !drainIntentMatches(drainCall.expected, intent)) {
+                sendJson(response, 409, {
+                  targetChanged: true,
+                  error: '等待期间要安装的版本或来源变了，没有执行安装。请重新确认后再试。 / The release or source to install changed while waiting; nothing was installed. Confirm it again and retry.',
+                })
+                return
+              }
+            }
             pendingRollbacks.clear()
             const compatibilityBefore = assessProfile(config.profile, activeProfileDir)
             // pnpm re-extracts the whole tree on any operation, so a plugin
@@ -7038,6 +7664,7 @@ sendJson(response, 200, { updates })
             // the manifest and left the half for the next pnpm run to trip on.
             const lockfileBefore = captureProfileLockfile()
             const pinned = target === pinnedTarget && pinnedTarget !== plainTarget
+            if (!assertDrainMutation(request, response)) return
             let result = await (pinned ? runPluginKeepingReleaseAge : runPlugin)(config.profile, ['add', target])
             // Set when the profile's own minimumReleaseAge is what kept this
             // install off the newest release (#635). The install SUCCEEDS —
@@ -7085,6 +7712,7 @@ sendJson(response, 200, { updates })
                     : `${entry.name}: the profile's registry could not resolve ${String(registryLatest)} (a mirror behind the registry that answered latest) — retrying with the bare name`)
                 restoreProfileManifest(config.profile, manifestBefore, activeProfileDir)
                 if (bypass) {
+                  if (!assertDrainMutation(request, response)) return
                   result = await runPlugin(config.profile, ['add', RELEASE_AGE_OVERRIDE, pinnedTarget])
                 }
                 if (!bypass || result.exitCode !== 0 || result.timedOut || result.cancelled) {
@@ -7093,6 +7721,7 @@ sendJson(response, 200, { updates })
                   // name, which is the version pnpm admits.
                   if (heldBack) heldByAge = true
                   target = plainTarget
+                  if (!assertDrainMutation(request, response)) return
                   result = await runPlugin(config.profile, ['add', target])
                 }
               }
@@ -7106,7 +7735,12 @@ sendJson(response, 200, { updates })
             // exact failure on this exact target: any other failure keeps its
             // own diagnosis, and a target that was never the entry's verified
             // tarball (an npm name, or already `github:`) is left alone.
-            if ((result.exitCode !== 0 || result.timedOut) && !result.cancelled) {
+            // A deferred drain operation approved one exact artifact. Falling
+            // back to the repository source would install a different one
+            // after the wait. An inline drain (no Agent was running) is the
+            // ordinary install path and keeps the fallback.
+            const deferredArtifact = drainCall?.role === 'execute' && drainCall.expected !== null
+            if ((result.exitCode !== 0 || result.timedOut) && !result.cancelled && !deferredArtifact) {
               const sourceTarget = sourceFallbackFor(entry, target)
               const failure = sourceTarget === null
                 ? null
@@ -7116,9 +7750,11 @@ sendJson(response, 200, { updates })
                 restoreProfileManifest(config.profile, manifestBefore, activeProfileDir)
                 if (lockfileBefore.ok) restoreProfileLockfile(lockfileBefore.snapshot)
                 target = await acceleratedTarget(sourceTarget, region)
+                if (!assertDrainMutation(request, response)) return
                 result = await runPlugin(config.profile, ['add', target])
               }
             }
+            drainPhaseOf(request)?.('verifying')
             const cancelled = result.cancelled
             const portCollisionLanded = !cancelled
               && isHostPortCollision(result)
@@ -7141,6 +7777,7 @@ sendJson(response, 200, { updates })
               // Collection repos (e.g. skin monorepos) install as a junk
               // fileset with no root package.json; retarget to the real
               // plugin subdirectories via pnpm's #path: selector.
+              if (!assertDrainMutation(request, response)) return
               ok = await retargetCollections(runPlugin, config.profile, before, target, activeProfileDir)
             }
             // Fake-success guard (#18): a clean exit that added nothing
@@ -7154,6 +7791,7 @@ sendJson(response, 200, { updates })
             let removedBroken: string[] = []
             let conflicts: { name: string; id: string; owner: string }[] = []
             if ((result.exitCode === 0 || portCollisionLanded) && !cancelled) {
+              if (!assertDrainMutation(request, response)) return
               const validated = await validateAddedPlugins(runPlugin, config.profile, before, activeProfileDir)
               removedBroken = validated.removedBroken
               conflicts = validated.conflicts
@@ -7405,19 +8043,23 @@ sendJson(response, 200, { updates })
               stderr: result.stderr,
               installed,
             })
-          })
+          }, request)
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error)
-          host.logger?.warn(`[dsh-market] install failed: ${message}`)
+          if (!inProbe()) host.logger?.warn(`[dsh-market] install failed: ${message}`)
           logEvent('error', 'install', `route error: ${message}`)
           sendJson(response, 500, { error: message })
         }
       },
-    }),
+    })),
   ]
 
   return () => {
     disposed = true
+    // Release Agent maintenance holds before the routes disappear. This is the
+    // disposer half of the single-finally + disposer guarantee (#411): an
+    // unloaded market must never leave an Agent parked behind a hold.
+    drainCoordinator.dispose()
     setBuildEnvSource(previousBuildEnvSource)
     configurePersistentLog(null)
     for (const dispose of disposers) dispose()

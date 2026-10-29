@@ -384,6 +384,16 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 			agentQueueStaleGone: "排队时它还在已安装列表里，现在已不在，因此跳过（没有卸载）。",
 			agentQueueStaleNoUpdate: "排队时它有可用更新，现在没有了，已跳过。",
 			queuedBadge: "排队中",
+			agentDrainBadge: "等待 Agent",
+			agentDrainWaiting: "等待 {0} 个 Agent 到达安全点…",
+			agentDrainShowAgents: "查看正在运行的会话",
+			agentDrainVerifying: "正在验证结果…",
+			agentDrainCancelled: "已取消。",
+			agentDrainRestarted: "宿主在这次操作完成前重启了，它已取消。需要的话请重新发起。",
+			agentDrainHistoryDone: "上次排队的操作已完成。",
+			agentDrainHistoryFailed: "上次排队的操作失败了（{0}）。请检查「已安装」或导出的日志。",
+			agentDrainHistoryFailedShort: "上次排队的操作失败了。请检查「已安装」或导出的日志。",
+			agentDrainHistoryCancelled: "上次排队的操作已取消。",
 			favoriteFailed: "收藏失败，请稍后重试",
 			favoriteUnavailable: "收藏功能暂不可用。请刷新页面或重启 dsh web。",
 			favoriteBusy: "插件操作未结束，收藏未保存，请稍后重试",
@@ -1158,6 +1168,16 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 			agentQueueStaleGone: "It was installed when you queued this, and is not now — skipped, nothing was uninstalled.",
 			agentQueueStaleNoUpdate: "It had an update available when you queued this, and does not now — skipped.",
 			queuedBadge: "Queued",
+			agentDrainBadge: "Waiting for Agents",
+			agentDrainWaiting: "Waiting for {0} Agent(s) to reach a safe point…",
+			agentDrainShowAgents: "Show running sessions",
+			agentDrainVerifying: "Verifying the result…",
+			agentDrainCancelled: "Cancelled.",
+			agentDrainRestarted: "The host restarted before this finished, so the task was cancelled. Start it again if you still need it.",
+			agentDrainHistoryDone: "The last deferred operation completed.",
+			agentDrainHistoryFailed: "The last deferred operation failed ({0}). Check Installed or the exported log.",
+			agentDrainHistoryFailedShort: "The last deferred operation failed. Check Installed or the exported log.",
+			agentDrainHistoryCancelled: "The last deferred operation was cancelled.",
 			favoriteFailed: "Could not update favorites. Try again.",
 			favoriteUnavailable: "Favorites are unavailable. Refresh the page or restart dsh web.",
 			favoriteBusy: "A plugin operation is still running. Favorites were not saved — try again shortly.",
@@ -1932,6 +1952,16 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 			agentQueueStaleGone: "キューに入れた時点ではインストール済みでしたが、現在は存在しないためスキップしました（アンインストールはしていません）。",
 			agentQueueStaleNoUpdate: "キューに入れた時点では利用できる更新がありましたが、現在はないためスキップしました。",
 			queuedBadge: "キュー待ち",
+			agentDrainBadge: "Agent 待ち",
+			agentDrainWaiting: "{0} 件の Agent が安全な地点に到達するのを待っています…",
+			agentDrainShowAgents: "実行中のセッションを表示",
+			agentDrainVerifying: "結果を確認しています…",
+			agentDrainCancelled: "キャンセルしました。",
+			agentDrainRestarted: "この操作が終わる前にホストが再起動したため、キャンセルされました。必要ならもう一度実行してください。",
+			agentDrainHistoryDone: "前回の保留操作は完了しました。",
+			agentDrainHistoryFailed: "前回の保留操作は失敗しました（{0}）。「インストール済み」またはエクスポートしたログを確認してください。",
+			agentDrainHistoryFailedShort: "前回の保留操作は失敗しました。「インストール済み」またはエクスポートしたログを確認してください。",
+			agentDrainHistoryCancelled: "前回の保留操作はキャンセルされました。",
 			favoriteFailed: "お気に入りを更新できませんでした。しばらくしてから再試行してください",
 			favoriteUnavailable: "お気に入り機能は現在使えません。ページを更新するか、dsh web を再起動してください。",
 			favoriteBusy: "プラグインの操作が終わっていないため、お気に入りは保存されませんでした。しばらくしてから再試行してください",
@@ -5006,7 +5036,7 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 		* that wrote it can still be waiting for that reload.
 		*/
 		function serializeSettled(list) {
-			return list.filter(isSettled).slice(-20).map((record) => ({
+			return list.filter(isSettled).filter((record) => record.hostOperationId === void 0).slice(-20).map((record) => ({
 				id: record.id,
 				kind: record.kind,
 				name: record.name,
@@ -5056,6 +5086,7 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 		function restoreSettledRecord(value) {
 			if (value === null || typeof value !== "object" || Array.isArray(value)) return null;
 			const row = value;
+			if (asText(row.hostOperationId) !== void 0) return null;
 			const id = asText(row.id);
 			const name = asText(row.name);
 			const kind = row.kind === "install" || row.kind === "update" || row.kind === "uninstall" ? row.kind : void 0;
@@ -5284,6 +5315,11 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 			switch (record.state) {
 				case "queued": {
 					const blockers = record.blockedBy?.length ?? 0;
+					if (record.hostOperationId !== void 0) {
+						const elapsed = record.waitSince === void 0 ? null : Math.max(0, Math.floor((Date.now() - record.waitSince) / 1e3));
+						const base = blockers > 0 ? t("agentDrainWaiting").replace("{0}", String(blockers)) : t("agentBusyQueued");
+						return elapsed === null ? base : `${base} (${String(elapsed)}s)`;
+					}
 					if (blockers > 0) return `${t("opQueued")} · ${t("opQueuedWaitingAgents").replace("{0}", String(blockers))}`;
 					return ahead === null || ahead === 0 ? t("opQueued") : `${t("opQueued")} · ${t("opQueuedAhead")} ${String(ahead)}`;
 				}
@@ -5300,6 +5336,13 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 			const wrapRef = (0, react.useRef)(null);
 			const summary = summarize(records);
 			const busy = summary.running + summary.queued > 0;
+			const waitingOnHost = records.some((record) => record.hostOperationId !== void 0 && record.state === "queued" && record.waitSince !== void 0);
+			const [, setClock] = (0, react.useState)(0);
+			(0, react.useEffect)(() => {
+				if (!waitingOnHost) return void 0;
+				const timer = setInterval(() => setClock((value) => value + 1), 1e3);
+				return () => clearInterval(timer);
+			}, [waitingOnHost]);
 			(0, react.useEffect)(() => {
 				if (!open) return void 0;
 				const onKey = (event) => {
@@ -5429,6 +5472,7 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 												className: bucketOf(record.state) === "attention" ? `${Market_module_css_default.opStatus} ${Market_module_css_default.opStatusBad}` : Market_module_css_default.opStatus,
 												children: statusLine(t, props.lang, record, ahead)
 											}),
+											record.hostOperationId !== void 0 && record.state === "queued" && (record.blockedBy?.length ?? 0) > 0 && /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("details", { children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("summary", { children: t("agentDrainShowAgents") }), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("ul", { children: record.blockedBy.map((id) => /* @__PURE__ */ (0, react_jsx_runtime.jsx)("li", { children: id }, id)) })] }),
 											needsUser(record) && /* @__PURE__ */ (0, react_jsx_runtime.jsx)(ConflictChoice, {
 												t,
 												record,
@@ -5448,7 +5492,12 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 												onClick: () => props.onCancel(record),
 												children: t("cancelOp")
 											}),
-											record.state === "queued" && /* @__PURE__ */ (0, react_jsx_runtime.jsxs)(react_jsx_runtime.Fragment, { children: [props.onRunNow !== void 0 && /* @__PURE__ */ (0, react_jsx_runtime.jsx)(_deepseek_ai_dsh_client_ui_primitives.Button, {
+											record.state === "queued" && (record.hostOperationId !== void 0 ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)(_deepseek_ai_dsh_client_ui_primitives.Button, {
+												variant: "outline",
+												size: "sm",
+												onClick: () => props.onCancel(record),
+												children: t("cancelOp")
+											}) : /* @__PURE__ */ (0, react_jsx_runtime.jsxs)(react_jsx_runtime.Fragment, { children: [props.onRunNow !== void 0 && /* @__PURE__ */ (0, react_jsx_runtime.jsx)(_deepseek_ai_dsh_client_ui_primitives.Button, {
 												variant: "primary",
 												size: "sm",
 												onClick: () => props.onRunNow?.(record),
@@ -5458,7 +5507,7 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 												size: "sm",
 												onClick: () => props.onDismiss(record),
 												children: t("opDequeue")
-											})] }),
+											})] })),
 											record.state === "done" && record.needsRefresh === true && /* @__PURE__ */ (0, react_jsx_runtime.jsx)(_deepseek_ai_dsh_client_ui_primitives.Button, {
 												variant: "primary",
 												size: "sm",
@@ -9597,6 +9646,17 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 			return names.length === 0 ? void 0 : names;
 		}
 		/**
+		* Drop a Host-projected row before the page's own record adopts the same
+		* operation id (#411).
+		*
+		* The status poll can create `host-<id>` while a slow probe is still running;
+		* without this the 202 would leave both rows pointing at one Host operation,
+		* and the panel's first match would keep the synthetic one forever.
+		*/
+		function withoutHostProjection(list, operationId, keepId) {
+			return list.filter((record) => record.id === keepId || record.id !== `host-${operationId}` && record.hostOperationId !== operationId);
+		}
+		/**
 		* Whether the "compatible with this host" filter starts on, and remembers the
 		* answer once the user disagrees with the default (#872).
 		*
@@ -9913,7 +9973,7 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 			(0, react.useEffect)(() => {
 				if (!queueRestoredRef.current) return;
 				try {
-					const queued = records.filter((record) => record.state === "queued").map((record) => ({
+					const queued = records.filter((record) => record.state === "queued" && record.hostOperationId === void 0).map((record) => ({
 						kind: record.kind,
 						name: record.name,
 						...record.url === void 0 ? {} : { url: record.url },
@@ -10438,7 +10498,9 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 			*/
 			const statusRef = (0, react.useRef)({
 				busy: false,
-				runningAgents: []
+				runningAgents: [],
+				agentDrain: false,
+				boot: null
 			});
 			/** True while the drain is executing one queued request (no parallel starts). */
 			const drainingRef = (0, react.useRef)(false);
@@ -10492,6 +10554,221 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 				setInstalledFiles,
 				setSkins,
 				setUpdates
+			]);
+			/**
+			* Host-owned deferred operations (#411).
+			*
+			* These rows are projections of `/status`, never entries in the client
+			* queue: the Host owns the maintenance holds, and re-running a row here
+			* would start a second mutation outside that barrier. `dshm-drain-v1`
+			* remembers only which operations this page asked for, so a Host restart can
+			* say "that one was cancelled" instead of leaving the user to guess.
+			*/
+			const settledHostRef = (0, react.useRef)(/* @__PURE__ */ new Set());
+			const knownHostIdsRef = (0, react.useRef)(/* @__PURE__ */ new Set());
+			/** Host operations the user cleared; a status poll must not add them back. */
+			const dismissedHostRef = (0, react.useRef)(/* @__PURE__ */ new Set());
+			const drainMarkerRestoredRef = (0, react.useRef)(false);
+			const clearDrainMarker = (0, react.useCallback)((operationId) => {
+				try {
+					const raw = localStorage.getItem("dshm-drain-v1");
+					if (raw === null) return;
+					const parsed = JSON.parse(raw);
+					if (!Array.isArray(parsed)) return;
+					const kept = parsed.filter((entry) => entry?.id !== operationId);
+					if (kept.length === 0) localStorage.removeItem("dshm-drain-v1");
+					else localStorage.setItem("dshm-drain-v1", JSON.stringify(kept));
+				} catch {}
+			}, []);
+			const rememberDrainMarker = (0, react.useCallback)((operation) => {
+				try {
+					const raw = localStorage.getItem("dshm-drain-v1");
+					const parsed = raw === null ? [] : JSON.parse(raw);
+					const list = Array.isArray(parsed) ? parsed : [];
+					if (list.some((entry) => entry?.id === operation.operationId)) return;
+					list.push({
+						id: operation.operationId,
+						kind: operation.kind,
+						name: operation.name,
+						...operation.url === void 0 ? {} : { url: operation.url }
+					});
+					localStorage.setItem("dshm-drain-v1", JSON.stringify(list));
+				} catch {}
+			}, []);
+			/** Mark operations this page started in an earlier boot as cancelled by restart. */
+			const restoreDrainMarkers = (0, react.useCallback)((status) => {
+				if (drainMarkerRestoredRef.current) return;
+				const boot = typeof status.boot === "string" ? status.boot : null;
+				if (boot === null) return;
+				drainMarkerRestoredRef.current = true;
+				let saved = null;
+				try {
+					saved = JSON.parse(localStorage.getItem("dshm-drain-v1") ?? "null");
+				} catch {
+					saved = null;
+				}
+				if (!Array.isArray(saved) || saved.length === 0) return;
+				const entries = saved.filter((entry) => {
+					if (entry === null || typeof entry !== "object") return false;
+					return typeof entry.id === "string";
+				});
+				const stale = entries.filter((entry) => !entry.id.startsWith(`${boot}-`));
+				const current = entries.filter((entry) => entry.id.startsWith(`${boot}-`));
+				if (stale.length > 0) {
+					setRecords((previous) => {
+						let next = previous;
+						for (const entry of stale) {
+							if (dismissedHostRef.current.has(entry.id)) continue;
+							if (next.some((record) => record.hostOperationId === entry.id || record.id === `host-${entry.id}`)) continue;
+							const kind = entry.kind === "install" || entry.kind === "update" || entry.kind === "uninstall" ? entry.kind : "update";
+							next = enqueue(next, {
+								id: `host-${entry.id}`,
+								kind,
+								name: typeof entry.name === "string" ? entry.name : "plugin",
+								...typeof entry.url === "string" ? { url: entry.url } : {},
+								hostOperationId: entry.id,
+								state: "warned",
+								reason: t("agentDrainRestarted")
+							});
+						}
+						return next;
+					});
+					setOperationsOpen(true);
+				}
+				try {
+					if (current.length > 0) localStorage.setItem("dshm-drain-v1", JSON.stringify(current));
+					else localStorage.removeItem("dshm-drain-v1");
+				} catch {}
+			}, [t]);
+			/** Project Host-owned operations into the Tasks panel. */
+			const applyDrainStatus = (0, react.useCallback)((status) => {
+				const operations = Array.isArray(status.drainOperations) ? status.drainOperations : [];
+				const history = Array.isArray(status.drainHistory) ? status.drainHistory : [];
+				if (operations.length === 0 && history.length === 0) return;
+				let opened = false;
+				for (const operation of operations) if (operation.state === "accepted" || operation.state === "draining" || operation.state === "queued-for-mutation" || operation.state === "running" || operation.state === "verifying") {
+					if (!knownHostIdsRef.current.has(operation.operationId)) {
+						knownHostIdsRef.current.add(operation.operationId);
+						opened = true;
+					}
+				}
+				for (const operation of operations) {
+					if (dismissedHostRef.current.has(operation.operationId)) continue;
+					if (operation.state !== "succeeded" && operation.state !== "failed" && operation.state !== "cancelled") continue;
+					clearDrainMarker(operation.operationId);
+					if (settledHostRef.current.has(operation.operationId)) continue;
+					settledHostRef.current.add(operation.operationId);
+					if (operation.state === "succeeded") {
+						refreshInstalled();
+						if (operation.outcome?.restartRequired === true) setRestartNames((names) => names.includes(operation.name) ? names : names.concat(operation.name));
+						if (operation.kind === "update") setUpdatedNames((names) => names.includes(operation.name) ? names : names.concat(operation.name));
+						if (operation.kind === "install" && operation.url !== void 0) setDoneUrls((urls) => urls.includes(operation.url) ? urls : urls.concat(operation.url));
+					} else refreshInstalled();
+				}
+				const hostRecord = (operation) => {
+					const base = {
+						id: `host-${operation.operationId}`,
+						kind: operation.kind,
+						name: operation.name,
+						...operation.url === void 0 ? {} : { url: operation.url },
+						hostOperationId: operation.operationId
+					};
+					if (operation.state === "accepted" || operation.state === "draining" || operation.state === "queued-for-mutation") return {
+						...base,
+						state: "queued",
+						...operation.wait === null ? {} : {
+							blockedBy: operation.wait.activeAgentIds,
+							waitSince: operation.wait.since
+						},
+						reason: operation.wait === null ? t("agentBusyQueued") : t("agentDrainWaiting").replace("{0}", String(operation.wait.activeCount))
+					};
+					if (operation.state === "running") return {
+						...base,
+						state: "running",
+						blockedBy: void 0,
+						waitSince: void 0,
+						reason: void 0
+					};
+					if (operation.state === "verifying") return {
+						...base,
+						state: "running",
+						detail: t("agentDrainVerifying"),
+						blockedBy: void 0,
+						waitSince: void 0,
+						reason: void 0
+					};
+					if (operation.state === "succeeded") return {
+						...base,
+						state: "done",
+						needsRefresh: operation.outcome?.needsRefresh === true,
+						blockedBy: void 0,
+						waitSince: void 0,
+						reason: void 0
+					};
+					if (operation.state === "cancelled") return {
+						...base,
+						state: "warned",
+						reason: t("agentDrainCancelled"),
+						blockedBy: void 0,
+						waitSince: void 0
+					};
+					return {
+						...base,
+						state: "failed",
+						reason: operation.failure?.message ?? t("installFail"),
+						blockedBy: void 0,
+						waitSince: void 0
+					};
+				};
+				setRecords((previous) => {
+					let next = previous;
+					for (const operation of operations) {
+						if (dismissedHostRef.current.has(operation.operationId)) continue;
+						const existing = next.find((record) => record.hostOperationId === operation.operationId);
+						const desired = hostRecord(operation);
+						if (existing === void 0) next = enqueue(next, desired);
+						else {
+							const { id: _id, kind: _kind, name: _name, hostOperationId: _host, ...changes } = desired;
+							next = patch(next, existing.id, changes);
+						}
+					}
+					for (const entry of history) {
+						if (dismissedHostRef.current.has(entry.id)) continue;
+						const id = `host-${entry.id}`;
+						const existing = next.find((record) => record.id === id || record.hostOperationId === entry.id);
+						const changes = entry.state === "succeeded" ? existing?.needsRefresh === true ? {
+							state: "done",
+							blockedBy: void 0,
+							waitSince: void 0,
+							reason: void 0
+						} : {
+							state: "done",
+							needsRefresh: false,
+							blockedBy: void 0,
+							waitSince: void 0,
+							reason: void 0
+						} : {
+							state: entry.state === "cancelled" ? "warned" : "failed",
+							reason: entry.state === "cancelled" ? t("agentDrainHistoryCancelled") : t("agentDrainHistoryFailedShort"),
+							blockedBy: void 0,
+							waitSince: void 0
+						};
+						if (existing !== void 0) next = patch(next, existing.id, changes);
+						else next = enqueue(next, {
+							id,
+							kind: entry.kind,
+							name: entry.name,
+							hostOperationId: entry.id,
+							...changes
+						});
+					}
+					return next;
+				});
+				if (opened) setOperationsOpen(true);
+			}, [
+				clearDrainMarker,
+				refreshInstalled,
+				t
 			]);
 			/** Active Bundles count as installed in Discover without becoming package-manager targets. */
 			const catalogInstalled = (0, react.useMemo)(() => installedForCatalog(installed, installedBundles), [installed, installedBundles]);
@@ -10638,8 +10915,12 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 					if (status === null) return;
 					statusRef.current = {
 						busy: status.busy === true,
-						runningAgents: Array.isArray(status.runningAgents) ? status.runningAgents.map(String) : []
+						runningAgents: Array.isArray(status.runningAgents) ? status.runningAgents.map(String) : [],
+						agentDrain: status.agentDrain === true,
+						boot: typeof status.boot === "string" ? status.boot : null
 					};
+					applyDrainStatus(status);
+					restoreDrainMarkers(status);
 					setEnvReady(status.pnpm !== false);
 					applyGithubRouting(status);
 					if (typeof status.boot === "string") {
@@ -10657,9 +10938,11 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 				}).catch(() => {});
 				refreshInstalled();
 			}, [
+				applyDrainStatus,
 				refreshInstalled,
 				loadCatalog,
-				readMarketStatus
+				readMarketStatus,
+				restoreDrainMarkers
 			]);
 			(0, react.useEffect)(() => {
 				if (bootId === null) return;
@@ -10768,8 +11051,12 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 						if (status === null) return;
 						statusRef.current = {
 							busy: status.busy === true,
-							runningAgents: Array.isArray(status.runningAgents) ? status.runningAgents.map(String) : []
+							runningAgents: Array.isArray(status.runningAgents) ? status.runningAgents.map(String) : [],
+							agentDrain: status.agentDrain === true,
+							boot: typeof status.boot === "string" ? status.boot : null
 						};
+						applyDrainStatus(status);
+						restoreDrainMarkers(status);
 						setHostBusy(status.busy === true);
 						setDebuggerLatch(typeof status.debugger === "string" ? status.debugger : null);
 						if (status.active) {
@@ -10853,6 +11140,7 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 				}, 2e3);
 				return () => clearInterval(timer);
 			}, [
+				applyDrainStatus,
 				busyUrl,
 				updatingName,
 				data,
@@ -10861,6 +11149,7 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 				repoHints,
 				refreshInstalled,
 				lang,
+				restoreDrainMarkers,
 				t
 			]);
 			const scrollToTop = () => {
@@ -11166,7 +11455,7 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 				const rest = entries.length > 1 ? ` (+${entries.length - 1})` : "";
 				return `${first.name} — ${first.layers.join(" / ")}${rest}`;
 			};
-			const doInstall = (0, react.useCallback)((plugin, force = false, version) => {
+			const doInstall = (0, react.useCallback)((plugin, force = false, version, preferReject = false) => {
 				setBuildsSkipped(null);
 				setConfirming(null);
 				setInstallError(null);
@@ -11190,7 +11479,8 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 					body: JSON.stringify({
 						url: plugin.url,
 						...force ? { force: true } : {},
-						...version !== void 0 ? { version } : {}
+						...version !== void 0 ? { version } : {},
+						...statusRef.current.agentDrain && !preferReject ? { busyPolicy: "drain" } : {}
 					})
 				}).then((res) => res.json().then((body) => ({
 					status: res.status,
@@ -11198,6 +11488,26 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 				}))).then(({ status, body }) => {
 					setBusyUrl(null);
 					sessionStorage.removeItem("dshm-pending");
+					if (status === 202 && typeof body.operationId === "string") {
+						const operation = body.operation;
+						setRecords((list) => patch(withoutHostProjection(list, body.operationId, recordId), recordId, {
+							state: "queued",
+							hostOperationId: body.operationId,
+							...operation?.wait === null || operation?.wait === void 0 ? {} : {
+								blockedBy: operation.wait.activeAgentIds,
+								waitSince: operation.wait.since
+							},
+							reason: operation?.wait === null || operation?.wait === void 0 ? t("agentBusyQueued") : t("agentDrainWaiting").replace("{0}", String(operation.wait.activeCount))
+						}));
+						rememberDrainMarker({
+							operationId: body.operationId,
+							kind: "install",
+							name: plugin.name,
+							url: plugin.url
+						});
+						setOperationsOpen(true);
+						return;
+					}
 					if (status === 200 && body.ok && body.hot && pluginCategories(plugin).includes("theme")) {
 						sessionStorage.setItem("dshm-toast", JSON.stringify([plugin.name]));
 						sessionStorage.setItem("dshm-tab", "themes");
@@ -11241,6 +11551,11 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 						}));
 						refreshInstalled();
 					} else {
+						if (body.unsupported === true) {
+							setRecords((list) => drop(list, recordId));
+							doInstall(plugin, force, version, true);
+							return;
+						}
 						if (body.agentsBusy !== true && body.migration && typeof body.migration === "object") {
 							const { from, target } = body.migration;
 							if (typeof from === "string" && typeof target === "string") {
@@ -11256,6 +11571,22 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 							}
 						}
 						if (status === 409) {
+							if (body.failureCode === "AGENT_BARRIER_LOST") {
+								setRecords((list) => patch(list, recordId, {
+									state: "failed",
+									reason: String(body.error ?? t("installFail"))
+								}));
+								setOperationsOpen(true);
+								return;
+							}
+							if (body.targetChanged === true) {
+								setRecords((list) => patch(list, recordId, {
+									state: "failed",
+									reason: String(body.error ?? t("installFail"))
+								}));
+								setOperationsOpen(true);
+								return;
+							}
 							if (body.agentsBusy === true) {
 								setRecords((list) => patch(list, recordId, {
 									state: "queued",
@@ -11315,6 +11646,7 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 			}, [
 				nextRecordId,
 				refreshInstalled,
+				rememberDrainMarker,
 				t,
 				installed
 			]);
@@ -11529,14 +11861,15 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 				enterRecovery
 			]);
 			/** Cancel the running plugin command (#6 by @qichuang321). */
-			const doCancel = (0, react.useCallback)(() => {
+			const doCancel = (0, react.useCallback)((record) => {
+				const body = record?.hostOperationId === void 0 ? {} : { operationId: record.hostOperationId };
 				fetch(api("/dsh-market/cancel"), {
 					method: "POST",
 					headers: { "content-type": "application/json" },
-					body: "{}"
+					body: JSON.stringify(body)
 				}).catch(() => {});
 			}, []);
-			const doUpdate = (0, react.useCallback)((name, force = false, restore = false, compatVersion, confirmAgentsRunning = false, eligibleVersion) => {
+			const doUpdate = (0, react.useCallback)((name, force = false, restore = false, compatVersion, confirmAgentsRunning = false, eligibleVersion, preferReject = false) => {
 				const expectedVersion = compatVersion === void 0 && !restore ? eligibleVersion ?? updates[name]?.eligibleVersion : void 0;
 				const updateOptions = {
 					force,
@@ -11569,7 +11902,8 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 						...restore ? { restore: true } : {},
 						...compatVersion !== void 0 ? { compatVersion } : {},
 						...expectedVersion !== void 0 ? { eligibleVersion: expectedVersion } : {},
-						...confirmAgentsRunning ? { confirmAgentsRunning: true } : {}
+						...confirmAgentsRunning ? { confirmAgentsRunning: true } : {},
+						...!restore && statusRef.current.agentDrain && !preferReject ? { busyPolicy: "drain" } : {}
 					})
 				}).then((res) => res.json().then((body) => ({
 					status: res.status,
@@ -11577,6 +11911,25 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 				}))).then(({ status, body }) => {
 					sessionStorage.removeItem("dshm-updating");
 					setUpdatingName(null);
+					if (status === 202 && typeof body.operationId === "string") {
+						const operation = body.operation;
+						setRecords((list) => patch(withoutHostProjection(list, body.operationId, updateRecordId), updateRecordId, {
+							state: "queued",
+							hostOperationId: body.operationId,
+							...operation?.wait === null || operation?.wait === void 0 ? {} : {
+								blockedBy: operation.wait.activeAgentIds,
+								waitSince: operation.wait.since
+							},
+							reason: operation?.wait === null || operation?.wait === void 0 ? t("agentBusyUpdateQueued") : t("agentDrainWaiting").replace("{0}", String(operation.wait.activeCount))
+						}));
+						rememberDrainMarker({
+							operationId: body.operationId,
+							kind: "update",
+							name
+						});
+						setOperationsOpen(true);
+						return;
+					}
 					if (body.cancelled === true) {
 						setRecords((list) => drop(list, updateRecordId));
 						refreshInstalled();
@@ -11613,7 +11966,29 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 						if (body.compatibility?.code === "soft-incompatible") setCompatibilityNotice(body.compatibility);
 						refreshInstalled();
 					} else {
+						if (body.unsupported === true) {
+							setRecords((list) => drop(list, updateRecordId));
+							doUpdate(name, force, restore, compatVersion, confirmAgentsRunning, eligibleVersion, true);
+							return;
+						}
 						if (status === 409) {
+							if (body.failureCode === "AGENT_BARRIER_LOST") {
+								setRecords((list) => patch(list, updateRecordId, {
+									state: "failed",
+									reason: String(body.error ?? "An Agent became active before the update; nothing was changed.")
+								}));
+								setOperationsOpen(true);
+								return;
+							}
+							if (body.targetChanged === true) {
+								setRecords((list) => patch(list, updateRecordId, {
+									state: "failed",
+									reason: String(body.error ?? "Update target changed")
+								}));
+								setInstallError(localizeBilingual(String(body.error ?? "Update target changed"), lang));
+								setOperationsOpen(true);
+								return;
+							}
 							if (body.agentsBusy === true) {
 								setRecords((list) => patch(list, updateRecordId, {
 									state: "queued",
@@ -11667,6 +12042,7 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 			}, [
 				refreshInstalled,
 				installed,
+				rememberDrainMarker,
 				t,
 				lang,
 				updates
@@ -12127,7 +12503,7 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 				setHotNames((names) => names.filter((entry) => entry !== name));
 				setRefreshNames((names) => names.filter((entry) => entry !== name));
 			}, []);
-			const doUninstall = (0, react.useCallback)((name, confirmAgentsRunning = false) => {
+			const doUninstall = (0, react.useCallback)((name, confirmAgentsRunning = false, preferReject = false) => {
 				setRemoveConfirm(null);
 				setInstallError(null);
 				setActivationWarnings([]);
@@ -12144,12 +12520,53 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 					headers: { "content-type": "application/json" },
 					body: JSON.stringify({
 						name,
-						...confirmAgentsRunning ? { confirmAgentsRunning: true } : {}
+						...confirmAgentsRunning ? { confirmAgentsRunning: true } : {},
+						...statusRef.current.agentDrain && !preferReject ? { busyPolicy: "drain" } : {}
 					})
 				}).then((res) => res.json().then((body) => ({
 					status: res.status,
 					body
 				}))).then(({ status, body }) => {
+					if (status === 202 && typeof body.operationId === "string") {
+						const operation = body.operation;
+						setRecords((list) => patch(withoutHostProjection(list, body.operationId, uninstallRecordId), uninstallRecordId, {
+							state: "queued",
+							hostOperationId: body.operationId,
+							...operation?.wait === null || operation?.wait === void 0 ? {} : {
+								blockedBy: operation.wait.activeAgentIds,
+								waitSince: operation.wait.since
+							},
+							reason: operation?.wait === null || operation?.wait === void 0 ? t("agentBusyUninstallQueued") : t("agentDrainWaiting").replace("{0}", String(operation.wait.activeCount))
+						}));
+						rememberDrainMarker({
+							operationId: body.operationId,
+							kind: "uninstall",
+							name
+						});
+						setOperationsOpen(true);
+						return;
+					}
+					if (body.unsupported === true) {
+						setRecords((list) => drop(list, uninstallRecordId));
+						doUninstall(name, confirmAgentsRunning, true);
+						return;
+					}
+					if (status === 409 && body.failureCode === "AGENT_BARRIER_LOST") {
+						setRecords((list) => patch(list, uninstallRecordId, {
+							state: "failed",
+							reason: String(body.error ?? "An Agent became active before the uninstall; nothing was changed.")
+						}));
+						setOperationsOpen(true);
+						return;
+					}
+					if (status === 409 && body.targetChanged === true) {
+						setRecords((list) => patch(list, uninstallRecordId, {
+							state: "failed",
+							reason: String(body.error ?? t("installFail"))
+						}));
+						setOperationsOpen(true);
+						return;
+					}
 					if (status === 409 && body.agentsBusy === true) {
 						setRecords((list) => patch(list, uninstallRecordId, {
 							state: "queued",
@@ -12187,6 +12604,7 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 				hotNames,
 				refreshNames,
 				nextRecordId,
+				rememberDrainMarker,
 				t
 			]);
 			const busyUrlRef = (0, react.useRef)(null);
@@ -12250,19 +12668,24 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 				const timer = setInterval(() => {
 					if (drainingRef.current) return;
 					if (operationInFlight()) return;
-					if (!recordsRef.current.some((record) => record.state === "queued")) return;
+					if (!recordsRef.current.some((record) => record.hostOperationId === void 0 ? record.state === "queued" : record.state === "queued" || record.state === "running")) return;
 					fetch(api("/dsh-market/status"), { cache: "no-store" }).then(readMarketStatus).then((status) => {
 						if (disposed || status === null) return;
 						const runningAgents = Array.isArray(status.runningAgents) ? status.runningAgents.map(String) : [];
 						const busy = status.busy === true;
 						statusRef.current = {
 							busy,
-							runningAgents
+							runningAgents,
+							agentDrain: status.agentDrain === true,
+							boot: typeof status.boot === "string" ? status.boot : null
 						};
+						applyDrainStatus(status);
+						restoreDrainMarkers(status);
 						if (busy) return;
+						if (status.drainActive === true) return;
 						if (operationInFlight()) return;
-						const task = recordsRef.current.find((record) => record.state === "queued" && (record.kind === "install" || runningAgents.length === 0));
-						if (task === void 0 || recordsRef.current.some((record) => record.state === "running")) return;
+						const task = recordsRef.current.find((record) => record.state === "queued" && record.hostOperationId === void 0 && (record.kind === "install" || runningAgents.length === 0));
+						if (task === void 0 || recordsRef.current.some((record) => record.state === "running" && record.hostOperationId === void 0)) return;
 						setRecords((list) => list.filter((record) => record.id !== task.id));
 						drainingRef.current = true;
 						try {
@@ -12280,9 +12703,14 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 					disposed = true;
 					clearInterval(timer);
 				};
-			}, [readMarketStatus]);
+			}, [
+				applyDrainStatus,
+				readMarketStatus,
+				restoreDrainMarkers
+			]);
 			/** A queued record's "run now": retry immediately instead of waiting for idle. */
 			const runQueuedNow = (0, react.useCallback)((record, confirmAgentsRunning = false) => {
+				if (record.hostOperationId !== void 0) return;
 				if (!recordsRef.current.some((item) => item.id === record.id && item.state === "queued")) return;
 				if (record.kind !== "install" && !confirmAgentsRunning && (statusRef.current.runningAgents.length > 0 || (record.blockedBy?.length ?? 0) > 0)) {
 					setAgentsConfirm({
@@ -13252,7 +13680,7 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 					type: "button",
 					className: Market_module_css_default.cardBlockedMark,
 					onClick: openOperations,
-					children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)(IconWarningOutline16, { size: 13 }), t("queuedBadge")]
+					children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)(IconWarningOutline16, { size: 13 }), t(record?.hostOperationId !== void 0 && (record.blockedBy?.length ?? 0) > 0 ? "agentDrainBadge" : "queuedBadge")]
 				}) : blocked ? /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("button", {
 					type: "button",
 					className: Market_module_css_default.cardBlockedMark,
@@ -13456,7 +13884,7 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 									variant: "outline",
 									size: "sm",
 									disabled: cancelling,
-									onClick: doCancel,
+									onClick: () => doCancel(),
 									children: cancelling ? t("cancelling") : t("cancelOp")
 								}),
 								/* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
@@ -13595,7 +14023,7 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 											type: "button",
 											className: Market_module_css_default.cardBlockedMark,
 											onClick: openOperations,
-											children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)(IconWarningOutline16, { size: 13 }), t("queuedBadge")]
+											children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)(IconWarningOutline16, { size: 13 }), t(record?.hostOperationId !== void 0 && (record.blockedBy?.length ?? 0) > 0 ? "agentDrainBadge" : "queuedBadge")]
 										}) : blocked ? /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("button", {
 											type: "button",
 											className: Market_module_css_default.cardBlockedMark,
@@ -13652,7 +14080,7 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 										variant: "outline",
 										size: "sm",
 										disabled: cancelling,
-										onClick: doCancel,
+										onClick: () => doCancel(),
 										children: cancelling ? t("cancelling") : t("cancelOp")
 									}),
 									/* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
@@ -14037,9 +14465,15 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 										onOpenChange: setOperationsOpen,
 										replacing,
 										envReady,
-										onClearSettled: () => setRecords((list) => clearSettled(list)),
-										onCancel: () => doCancel(),
-										onDismiss: (record) => setRecords((list) => drop(list, record.id)),
+										onClearSettled: () => {
+											for (const record of recordsRef.current) if (record.hostOperationId !== void 0 && (record.state === "done" || record.state === "warned" || record.state === "failed")) dismissedHostRef.current.add(record.hostOperationId);
+											setRecords((list) => clearSettled(list));
+										},
+										onCancel: (record) => doCancel(record),
+										onDismiss: (record) => {
+											if (record.hostOperationId !== void 0) dismissedHostRef.current.add(record.hostOperationId);
+											setRecords((list) => drop(list, record.id));
+										},
 										onRefresh: () => location.reload(),
 										onResolveConflict: resolveConflict,
 										onForceInstall: (record) => {
@@ -15653,7 +16087,7 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 															variant: "outline",
 															size: "sm",
 															disabled: cancelling,
-															onClick: doCancel,
+															onClick: () => doCancel(),
 															children: cancelling ? t("cancelling") : t("cancelOp")
 														}),
 														/* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
