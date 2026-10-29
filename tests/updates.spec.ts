@@ -264,11 +264,14 @@ describe('checkUpdates — fresh-release wait (#945)', () => {
     expect(result.widget?.updateAvailable).toBe(true)
   })
 
-  it('fails closed for environment policies that override the profile and invalidates the cached target', async () => {
+  it('follows a wider environment window over the profile and invalidates the cached target (#1053)', async () => {
     const dir = npmProfile(1440)
     registry(hoursAgo(48))
     const before = await checkUpdates('web', true, dir, new Map(), new Map(), new Map(), { holdYoungReleases: true })
     expect(before.widget?.eligibleVersion).toBe('1.1.0')
+    // A week, in minutes: the release below is two hours old, so this holds
+    // it — not because the value is unreadable (that was #1053) but because
+    // it is a real wait pnpm would also apply.
     vi.stubEnv('PNPM_CONFIG_MINIMUM_RELEASE_AGE', '10080')
     try {
       const after = await checkUpdates('web', false, dir, new Map(), new Map(), new Map(), { holdYoungReleases: true })
