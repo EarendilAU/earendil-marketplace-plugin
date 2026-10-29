@@ -240,17 +240,20 @@ describe('loadRegistry download regions', () => {
     // must mean a slow market, not an empty one.
     const stub = byUrl([
       [/mirrors\.cloud\.tencent\.com/, new Error('fetch failed')],
+      // The second mirror is dead too — the state #1051 reported: one refused
+      // mirror left the origin as the only other host.
+      [/registry\.npmmirror\.com/, new Error('fetch failed')],
       [/awesome-dsh-plugin\.com/, ok(CATALOG)],
     ])
     const registry = await loadRegistry('china')
     expect(registry.plugins).toHaveLength(1)
-    // Two attempts at the package, then the origin.
-    expect(stub).toHaveBeenCalledTimes(3)
+    // Two attempts at each mirror, then the origin.
+    expect(stub).toHaveBeenCalledTimes(5)
   })
 
   it('reports every attempt it made when the whole list fails', async () => {
     byUrl([[/./, new Error('fetch failed')]])
-    await expect(loadRegistry('china')).rejects.toThrow(/4 attempts/)
+    await expect(loadRegistry('china')).rejects.toThrow(/6 attempts/)
   })
 
   it('stops at its own region when that region answers (#891)', async () => {
