@@ -325,6 +325,52 @@ describe('checkUpdates — fresh-release wait (#945)', () => {
     },
   )
 
+  it('treats a numeric environment window as a known policy instead of holding every update forever (#1053)', async () => {
+    // DSH Desktop sets PNPM_CONFIG_MINIMUM_RELEASE_AGE=0 for every pnpm call.
+    // The environment branch scanned before any file read turned that into
+    // policy-unknown, so every desktop user saw "新版等待中" forever.
+    const dir = npmProfile()
+    registry(hoursAgo(1))
+    vi.stubEnv('PNPM_CONFIG_MINIMUM_RELEASE_AGE', '0')
+    try {
+      const resolved = await resolveDesktopMatureUpdate('widget', '1.0.0', 'web', dir, '1.1.0')
+      expect(resolved.reason).not.toBe('policy-unknown')
+      expect(resolved.candidate).toBe('1.1.0')
+      expect(resolved.heldUpdate).toBeUndefined()
+    } finally { vi.unstubAllEnvs() }
+  })
+
+  it('uses a positive integer environment window as the wait (#1053)', async () => {
+    // 60 minutes covers a two-hour-old release, so the env value (not pnpm's
+    // 1440-minute default) decides. An unread numeric env is the bug; a read
+    // one must also carry its value or the window stays the wrong length.
+    const dir = npmProfile()
+    registry(hoursAgo(2))
+    vi.stubEnv('PNPM_CONFIG_MINIMUM_RELEASE_AGE', '60')
+    try {
+      const resolved = await resolveDesktopMatureUpdate('widget', '1.0.0', 'web', dir, '1.1.0')
+      expect(resolved.reason).toBe('eligible')
+      expect(resolved.candidate).toBe('1.1.0')
+    } finally { vi.unstubAllEnvs() }
+  })
+
+  it('still refuses an environment window that is not a number (#1053)', async () => {
+    const dir = npmProfile()
+    registry(hoursAgo(48))
+    vi.stubEnv('PNPM_CONFIG_MINIMUM_RELEASE_AGE', 'soon')
+    try {
+      expect((await resolveDesktopMatureUpdate('widget', '1.0.0', 'web', dir, '1.1.0')).reason).toBe('policy-unknown')
+    } finally { vi.unstubAllEnvs() }
+  })
+
+  it('keeps the profile window when no environment window is set (#1053)', async () => {
+    const dir = npmProfile(1440)
+    registry(hoursAgo(1))
+    const resolved = await resolveDesktopMatureUpdate('widget', '1.0.0', 'web', dir, '1.1.0')
+    expect(resolved.reason).not.toBe('policy-unknown')
+    expect(resolved.heldUpdate?.latest).toBe('1.1.0')
+  })
+
   it.each(['minimum-release-age-exclude=widget', 'minimumReleaseAgeExclude[]=widget', 'minimum-release-age-exclude[]=widget', 'minimum-release-age-unknown=true', 'minimum-release-age-strict=invalid'])(
     'refuses unverified external npmrc policy %s (#991 approved)', async policy => {
       const dir = npmProfile(1440)

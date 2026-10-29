@@ -511,15 +511,50 @@ export function pnpmRefusedYoungRelease(result: InstallResult): boolean {
 const DEFAULT_RELEASE_AGE_WINDOW_MS = 24 * 60 * 60 * 1000
 
 /**
+ * Whether an environment variable names the top-level fresh-release window
+ * and carries a plain non-negative integer.
+ *
+ * DSH Desktop sets `pnpm_config_minimum_release_age=0` for every pnpm call,
+ * so a numeric environment value is a window the market can follow — not an
+ * unverifiable external policy (#1053).
+ */
+export function isNumericReleaseAgeWindow(key: string, value: string | undefined): boolean {
+  const normalized = key.replace(/[-_]/g, '').toLowerCase()
+  return normalized === 'minimumreleaseage' && /^\d+$/.test(value?.trim() ?? '')
+}
+
+/** @returns minutes, `'invalid'` when the window variable is present but unreadable, or null when absent. */
+function readReleaseAgeMinutesFromEnv(): number | 'invalid' | null {
+  let minutes: number | null = null
+  for (const [key, value] of Object.entries(process.env)) {
+    const setting = /(?:^|_)(minimum[-_]?release[-_]?age[\w-]*)/i.exec(key)
+    if (setting === null) continue
+    if (setting[1]!.replace(/[-_]/g, '').toLowerCase() !== 'minimumreleaseage') continue
+    if (!isNumericReleaseAgeWindow(setting[1]!, value)) return 'invalid'
+    const parsed = Number(value)
+    if (!Number.isFinite(parsed)) return 'invalid'
+    if (minutes !== null && minutes !== parsed) return 'invalid'
+    minutes = parsed
+  }
+  return minutes
+}
+
+/**
  * The profile's fresh-release wait window in ms (#919).
  *
  * Reads `minimumReleaseAge` (minutes) from pnpm-workspace.yaml, then
- * `minimum-release-age` from `.npmrc`. A key that is present but not a
- * number returns null — callers must not invent a remaining wait. When
- * neither file names the key, pnpm's default 1440 minutes applies.
+ * `minimum-release-age` from `.npmrc`. A numeric environment window — the
+ * Desktop manager sets one for every pnpm call — takes precedence over both,
+ * because that is the value its pnpm actually uses (#1053). A key that is
+ * present but not a number returns null — callers must not invent a remaining
+ * wait. When neither file nor the environment names the key, pnpm's default
+ * 1440 minutes applies.
  */
 export function readMinimumReleaseAgeMs(profile: string, explicitDir?: string): number | null {
   const dir = profileDir(profile, explicitDir)
+  const fromEnv = readReleaseAgeMinutesFromEnv()
+  if (fromEnv === 'invalid') return null
+  if (typeof fromEnv === 'number') return fromEnv * 60 * 1000
   const fromWorkspace = readReleaseAgeMinutesFromWorkspace(dir)
   if (fromWorkspace === 'invalid') return null
   if (typeof fromWorkspace === 'number') return fromWorkspace * 60 * 1000

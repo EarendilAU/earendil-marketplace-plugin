@@ -13,7 +13,7 @@ import { resolveHeadCommit } from './accelerate.ts'
 import { marketFetch } from './net.ts'
 import { activeRegion, githubRoutesFor, rememberGithubRoute, throughProxy, type Region } from './regions.ts'
 import type { GitToNpmMigration, NpmRenameMigration } from './source-migration.ts'
-import { readMinimumReleaseAgeMs } from './install.ts'
+import { isNumericReleaseAgeWindow, readMinimumReleaseAgeMs } from './install.ts'
 import { isStableReleaseVersion, selectMatureUpdate, type MatureUpdateSelection, type NpmPackument } from './release-candidates.ts'
 import { hasDshManifest, profileDir, readGitResolutionCommit, readInstalled, readInstalledVersion, readLockCommits, readProfileBundles } from './profile.ts'
 import { userPatchPackageReferences } from './patch.ts'
@@ -304,7 +304,13 @@ function readReleaseAgeExclusions(dir: string, name: string): ReleaseAgePolicyRe
   }
   for (const [key, value] of Object.entries(process.env)) {
     const setting = /(?:^|_)(minimum[-_]?release[-_]?age[\w-]*)/i.exec(key)
-    if (setting !== null && !nativeTransitiveSetting(setting[1]!, value)) return unknown
+    if (setting === null) continue
+    // A numeric window is knowable: install.ts reads the same variable as the
+    // wait this plugin enforces, and DSH Desktop sets it to `0` for every
+    // pnpm call. Treating it as external-and-unverifiable held every update
+    // forever (#1053). Other spellings still fail closed.
+    if (isNumericReleaseAgeWindow(setting[1]!, value) || nativeTransitiveSetting(setting[1]!, value)) continue
+    return unknown
   }
   let source: string
   try { source = readFileSync(join(dir, 'pnpm-workspace.yaml'), 'utf8') } catch (error) {
