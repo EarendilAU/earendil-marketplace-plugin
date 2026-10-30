@@ -55,7 +55,7 @@ import type { SidebarEntry } from './sidebar-entry.ts'
 import {
   installCommandFor, hostCompatibilityKey,
   api, applyGithubRouting, avatarColor, catalogEntryForInstalled, entryForDep, failureText, githubRouteCandidates, groupSwitchState, installedForCatalog, isGenerationSpec, isInstalled, localizeBilingual, localizeBilingualList, looksTerminal, matchInstalledName, orderedCategories, pluginCategories,
-  formatCount, pageItems, pluginName, blockAliases, pluginScreenshotCandidates, pluginScreenshots, pluginsForFavorites, queuedRowApplies, rankThemeScreenshots, readSession, safeIcon, releaseNotesHttpsImage, rememberGithubRoute, resetScreenshotsCache, resolveCatalogRestore, safeScreenshots, sanitizeReleaseNotesBody, staleFavoriteUrls, themePlugins as themePluginsOf, themeSwatch, TIME_RANGE_DAYS, visiblePlugins, restartHintKey,
+  formatCount, pageItems, pluginName, blockAliases, pluginScreenshotCandidates, pluginScreenshots, pluginsForFavorites, previewDimensionScore, queuedRowApplies, rankThemeScreenshots, readSession, safeIcon, releaseNotesHttpsImage, rememberGithubRoute, resetScreenshotsCache, resolveCatalogRestore, safeScreenshots, sanitizeReleaseNotesBody, staleFavoriteUrls, themePlugins as themePluginsOf, themeSwatch, TIME_RANGE_DAYS, visiblePlugins, restartHintKey,
 } from './market-data.ts'
 import type {
 ActivationInfo, ActivationState, DrainHistoryWire, DrainOperationWire, GistExportResult, InstalledMap, InstalledRepoHints, InstalledRepoIdentities, MarketStatus, Registry, RegistryPlugin,
@@ -623,7 +623,7 @@ function useAutoCarousel(count: number, initial: number, intervalMs = 3500): [nu
  * left to save, and once the thumbnail is genuinely smaller it can no longer
  * share a cache entry with the full-size open anyway.
  */
-function thumbUrl(src: string, height: number): string {
+function thumbUrl(src: string, height: number, options: { webp?: boolean } = {}): string {
   // The resizer stays in every region, including China.
   //
   // It was briefly bypassed there on the assumption that a service in the
@@ -632,7 +632,14 @@ function thumbUrl(src: string, height: number): string {
   // in 1.39s, and it answers with 23KB where the original is 41KB. Routing
   // around it would have traded a working request for a bigger one, on a
   // page that makes dozens of them.
-  return `https://images.weserv.nl/?url=${encodeURIComponent(src.replace(/^https?:\/\//, ''))}&h=${String(height)}&fit=inside&we=1`
+  const encoded = encodeURIComponent(src.replace(/^https?:\/\//, ''))
+  let url = `https://images.weserv.nl/?url=${encoded}&h=${String(height)}&fit=inside&we=1`
+  // Theme covers ask for webp on still photos: a 520px PNG of a UI
+  // screenshot still weighed 0.4–0.6 MB (#1060). Only png/jpeg/webp URLs
+  // opt in — GIFs and extension-less GitHub attachments stay resized-only
+  // so an animated cover is not flattened to its first frame.
+  if (options.webp === true && /\.(?:png|jpe?g|webp)(?:$|[?#])/iu.test(src)) url += '&output=webp'
+  return url
 }
 
 /**
@@ -675,6 +682,17 @@ function useNearViewport<T extends Element>(rootMargin = '200px'): [(node: T | n
 /** Thumbnails per card. The dialog shows every screenshot; a grid of cards
  * pulling six full-size PNGs each is what makes the first paint crawl. */
 const CARD_SHOT_LIMIT = 3
+/**
+ * Theme gallery is 4-up (16:10 tile ≈ 150px tall in a typical panel). 320px
+ * is ~2× that; 520 was a near-full-bleed PNG and still hundreds of KB (#1060).
+ */
+const THEME_COVER_HEIGHT = 320
+/** About half a cover row — off-screen theme cards must not prefetch. */
+const THEME_COVER_ROOT_MARGIN = '80px'
+/** First-pass geometry probes for a README fallback. If none of these
+ * pass as a cover, the remaining candidates (still capped at six) are
+ * measured too — otherwise a later landscape is dropped before ranking. */
+const THEME_PREVIEW_PROBE_LIMIT = 3
 
 function CardShot({ plugin, onOpen }: { plugin: RegistryPlugin; onOpen: (shots: string[], index: number) => void }) {
   const shots = safeScreenshots(plugin.screenshots)
@@ -709,24 +727,30 @@ function CardShot({ plugin, onOpen }: { plugin: RegistryPlugin; onOpen: (shots: 
  */
 function measureThemeCandidates(candidates: ScreenshotCandidate[]): Promise<ScreenshotMeasurement[]> {
   if (typeof Image === 'undefined') return Promise.resolve([])
-  return Promise.all(candidates.map(candidate => new Promise<ScreenshotMeasurement | null>((resolve) => {
-    const probe = new Image()
-    let settled = false
-    const finish = (measurement: ScreenshotMeasurement | null) => {
-      if (settled) return
-      settled = true
-      window.clearTimeout(timer)
-      probe.onload = null
-      probe.onerror = null
-      resolve(measurement)
-    }
-    const timer = window.setTimeout(() => finish(null), 6_000)
-    probe.onload = () => finish({ src: candidate.src, width: probe.naturalWidth, height: probe.naturalHeight })
-    probe.onerror = () => finish(null)
-    probe.referrerPolicy = 'no-referrer'
-    probe.decoding = 'async'
-    probe.src = thumbUrl(candidate.src, 240)
-  }))).then(results => results.filter((result): result is ScreenshotMeasurement => result !== null))
+  const measureBatch = (batch: ScreenshotCandidate[]): Promise<ScreenshotMeasurement[]> =>
+    Promise.all(batch.map(candidate => new Promise<ScreenshotMeasurement | null>((resolve) => {
+      const probe = new Image()
+      let settled = false
+      const finish = (measurement: ScreenshotMeasurement | null) => {
+        if (settled) return
+        settled = true
+        window.clearTimeout(timer)
+        probe.onload = null
+        probe.onerror = null
+        resolve(measurement)
+      }
+      const timer = window.setTimeout(() => finish(null), 6_000)
+      probe.onload = () => finish({ src: candidate.src, width: probe.naturalWidth, height: probe.naturalHeight })
+      probe.onerror = () => finish(null)
+      probe.referrerPolicy = 'no-referrer'
+      probe.decoding = 'async'
+      probe.src = thumbUrl(candidate.src, 240)
+    }))).then(results => results.filter((result): result is ScreenshotMeasurement => result !== null))
+  return measureBatch(candidates.slice(0, THEME_PREVIEW_PROBE_LIMIT)).then(first => {
+    if (first.some(item => previewDimensionScore(item.width, item.height) !== null)
+      || candidates.length <= THEME_PREVIEW_PROBE_LIMIT) return first
+    return measureBatch(candidates.slice(THEME_PREVIEW_PROBE_LIMIT)).then(rest => first.concat(rest))
+  })
 }
 
 const measuredThemePreviewTasks = new Map<string, Promise<string[]>>()
@@ -775,7 +799,7 @@ function ThemeCover({ plugin, onOpen, t }: {
     shots: cachedFallback ?? [],
   })
   const [broken, setBroken] = useState<string[]>([])
-  const [setCoverRef, near] = useNearViewport<HTMLButtonElement>()
+  const [setCoverRef, near] = useNearViewport<HTMLButtonElement>(THEME_COVER_ROOT_MARGIN)
   useEffect(() => {
     setBroken([])
     if (curated.length > 0) {
@@ -827,7 +851,7 @@ function ThemeCover({ plugin, onOpen, t }: {
       onClick={() => onOpen(visible, 0)}
     >
       <img
-        src={near ? thumbUrl(src, 520) : undefined}
+        src={near ? thumbUrl(src, THEME_COVER_HEIGHT, { webp: true }) : undefined}
         alt=""
         loading="lazy"
         decoding="async"

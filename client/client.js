@@ -8348,8 +8348,10 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 		* left to save, and once the thumbnail is genuinely smaller it can no longer
 		* share a cache entry with the full-size open anyway.
 		*/
-		function thumbUrl(src, height) {
-			return `https://images.weserv.nl/?url=${encodeURIComponent(src.replace(/^https?:\/\//, ""))}&h=${String(height)}&fit=inside&we=1`;
+		function thumbUrl(src, height, options = {}) {
+			let url = `https://images.weserv.nl/?url=${encodeURIComponent(src.replace(/^https?:\/\//, ""))}&h=${String(height)}&fit=inside&we=1`;
+			if (options.webp === true && /\.(?:png|jpe?g|webp)(?:$|[?#])/iu.test(src)) url += "&output=webp";
+			return url;
 		}
 		/**
 		* True once the wrapped element has scrolled within `rootMargin` of the
@@ -8394,6 +8396,17 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 		/** Thumbnails per card. The dialog shows every screenshot; a grid of cards
 		* pulling six full-size PNGs each is what makes the first paint crawl. */
 		const CARD_SHOT_LIMIT = 3;
+		/**
+		* Theme gallery is 4-up (16:10 tile ≈ 150px tall in a typical panel). 320px
+		* is ~2× that; 520 was a near-full-bleed PNG and still hundreds of KB (#1060).
+		*/
+		const THEME_COVER_HEIGHT = 320;
+		/** About half a cover row — off-screen theme cards must not prefetch. */
+		const THEME_COVER_ROOT_MARGIN = "80px";
+		/** First-pass geometry probes for a README fallback. If none of these
+		* pass as a cover, the remaining candidates (still capped at six) are
+		* measured too — otherwise a later landscape is dropped before ranking. */
+		const THEME_PREVIEW_PROBE_LIMIT = 3;
 		function CardShot({ plugin, onOpen }) {
 			const shots = safeScreenshots(plugin.screenshots);
 			const [broken, setBroken] = (0, react.useState)([]);
@@ -8426,7 +8439,7 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 		*/
 		function measureThemeCandidates(candidates) {
 			if (typeof Image === "undefined") return Promise.resolve([]);
-			return Promise.all(candidates.map((candidate) => new Promise((resolve) => {
+			const measureBatch = (batch) => Promise.all(batch.map((candidate) => new Promise((resolve) => {
 				const probe = new Image();
 				let settled = false;
 				const finish = (measurement) => {
@@ -8448,6 +8461,10 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 				probe.decoding = "async";
 				probe.src = thumbUrl(candidate.src, 240);
 			}))).then((results) => results.filter((result) => result !== null));
+			return measureBatch(candidates.slice(0, THEME_PREVIEW_PROBE_LIMIT)).then((first) => {
+				if (first.some((item) => previewDimensionScore(item.width, item.height) !== null) || candidates.length <= THEME_PREVIEW_PROBE_LIMIT) return first;
+				return measureBatch(candidates.slice(THEME_PREVIEW_PROBE_LIMIT)).then((rest) => first.concat(rest));
+			});
 		}
 		const measuredThemePreviewTasks = /* @__PURE__ */ new Map();
 		const measuredThemePreviewResults = /* @__PURE__ */ new Map();
@@ -8487,7 +8504,7 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 				shots: cachedFallback ?? []
 			});
 			const [broken, setBroken] = (0, react.useState)([]);
-			const [setCoverRef, near] = useNearViewport();
+			const [setCoverRef, near] = useNearViewport(THEME_COVER_ROOT_MARGIN);
 			(0, react.useEffect)(() => {
 				setBroken([]);
 				if (curated.length > 0) {
@@ -8547,7 +8564,7 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 				onClick: () => onOpen(visible, 0),
 				children: [
 					/* @__PURE__ */ (0, react_jsx_runtime.jsx)("img", {
-						src: near ? thumbUrl(src, 520) : void 0,
+						src: near ? thumbUrl(src, THEME_COVER_HEIGHT, { webp: true }) : void 0,
 						alt: "",
 						loading: "lazy",
 						decoding: "async",

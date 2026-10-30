@@ -6644,17 +6644,91 @@ describe('per-tab search boxes', () => {
     expect((document.querySelector('[class*="lightboxImg"]') as HTMLImageElement).src).toBe(shotA)
   })
 
+  /**
+   * Theme covers used h=520 PNG, which on a 4-up grid is far above the painted
+   * 16:10 tile and still hundreds of KB (#1060). The lightbox keeps the original.
+   */
+  it('loads a compact webp theme cover, not a 520px PNG or the original (#1060)', async () => {
+    const shotA = 'https://raw.githubusercontent.com/carol/whale-skin/main/assets/light.png'
+    const registry = JSON.parse(JSON.stringify(REGISTRY))
+    registry.plugins[2].screenshots = [shotA]
+    stubFetch({ '/dsh-market/registry': { source: 'live', registry } })
+    const THEME_SNAPSHOT = { preference: 'light', themes: [] as Array<{ id: string }> }
+    render(<MarketSection {...{
+      ...props(),
+      themeStore: { subscribe: () => () => {}, getSnapshot: () => THEME_SNAPSHOT },
+    }} />)
+
+    await screen.findByText('dsh-loop')
+    fireEvent.click(screen.getAllByRole('button', { name: en.tabThemes })[0])
+    const cover = await screen.findByRole('button', { name: `${en.themePreview} whale-skin` })
+    const src = cover.querySelector('img')?.getAttribute('src') ?? ''
+    const encoded = encodeURIComponent(shotA.replace(/^https?:\/\//, ''))
+    expect(src).toBe(`https://images.weserv.nl/?url=${encoded}&h=320&fit=inside&we=1&output=webp`)
+    expect(src).not.toContain('h=520')
+    expect(src).not.toBe(shotA)
+  })
+
+  it('keeps a GIF theme cover on the original format so the animation is not flattened (#1060)', async () => {
+    const shotA = 'https://raw.githubusercontent.com/carol/whale-skin/main/assets/cover.gif'
+    const registry = JSON.parse(JSON.stringify(REGISTRY))
+    registry.plugins[2].screenshots = [shotA]
+    stubFetch({ '/dsh-market/registry': { source: 'live', registry } })
+    const THEME_SNAPSHOT = { preference: 'light', themes: [] as Array<{ id: string }> }
+    render(<MarketSection {...{
+      ...props(),
+      themeStore: { subscribe: () => () => {}, getSnapshot: () => THEME_SNAPSHOT },
+    }} />)
+
+    await screen.findByText('dsh-loop')
+    fireEvent.click(screen.getAllByRole('button', { name: en.tabThemes })[0])
+    const cover = await screen.findByRole('button', { name: `${en.themePreview} whale-skin` })
+    const src = cover.querySelector('img')?.getAttribute('src') ?? ''
+    expect(src).toContain('h=320')
+    expect(src).not.toContain('output=webp')
+  })
+
+  it('does not transcode a GitHub attachment theme cover to webp (#1060)', async () => {
+    const shotA = 'https://github.com/user-attachments/assets/d732b30f-2649-4758-bc7a-c57a1cac6e14'
+    const registry = JSON.parse(JSON.stringify(REGISTRY))
+    registry.plugins[2].screenshots = [shotA]
+    stubFetch({ '/dsh-market/registry': { source: 'live', registry } })
+    const THEME_SNAPSHOT = { preference: 'light', themes: [] as Array<{ id: string }> }
+    render(<MarketSection {...{
+      ...props(),
+      themeStore: { subscribe: () => () => {}, getSnapshot: () => THEME_SNAPSHOT },
+    }} />)
+
+    await screen.findByText('dsh-loop')
+    fireEvent.click(screen.getAllByRole('button', { name: en.tabThemes })[0])
+    const cover = await screen.findByRole('button', { name: `${en.themePreview} whale-skin` })
+    const src = cover.querySelector('img')?.getAttribute('src') ?? ''
+    expect(src).toContain('h=320')
+    expect(src).not.toContain('output=webp')
+  })
+
+  it('asks the theme-cover observer for a short root margin so off-screen rows do not prefetch (#1060)', () => {
+    const source = readFileSync(resolve('src/client/MarketSection.tsx'), 'utf8')
+    expect(source).toMatch(/const THEME_COVER_HEIGHT = 320/)
+    expect(source).toMatch(/const THEME_COVER_ROOT_MARGIN = '80px'/)
+    expect(source).toMatch(/useNearViewport<HTMLButtonElement>\(THEME_COVER_ROOT_MARGIN\)/)
+    expect(source).toMatch(/thumbUrl\(src, THEME_COVER_HEIGHT, \{ webp: true \}\)/)
+    expect(source).toMatch(/const THEME_PREVIEW_PROBE_LIMIT = 3/)
+  })
+
   it('fills a missing theme cover from README and chooses the complete landscape screenshot', async () => {
     const logo = 'https://raw.githubusercontent.com/carol/whale-skin/HEAD/assets/logo.png'
     const fragment = 'https://raw.githubusercontent.com/carol/whale-skin/HEAD/assets/settings-screenshot.png'
     const complete = 'https://raw.githubusercontent.com/carol/whale-skin/HEAD/docs/theme-preview.png'
     const readmeUrl = 'https://raw.githubusercontent.com/carol/whale-skin/HEAD/README.md'
+    const extra = [4, 5, 6].map(n => `https://raw.githubusercontent.com/carol/whale-skin/HEAD/docs/extra-${n}.png`)
     const readme = [
       '# whale-skin',
       '![project logo](assets/logo.png)',
       '## Screenshots',
       '![settings screenshot](assets/settings-screenshot.png)',
       '![Full theme preview](docs/theme-preview.png)',
+      ...extra.map((url, i) => `![screenshot extra ${i + 4}](${url})`),
     ].join('\n')
     vi.stubGlobal('fetch', vi.fn((url: string) => {
       const path = String(url).split('?')[0]
@@ -6668,6 +6742,7 @@ describe('per-tab search boxes', () => {
       if (path === readmeUrl) return Promise.resolve(new Response(readme, { status: 200 }))
       return Promise.reject(new Error(`unstubbed fetch: ${String(url)}`))
     }))
+    const probed: string[] = []
     class ProbeImage {
       naturalWidth = 0
       naturalHeight = 0
@@ -6676,6 +6751,7 @@ describe('per-tab search boxes', () => {
       referrerPolicy = ''
       decoding = ''
       set src(value: string) {
+        probed.push(value)
         if (value.includes(encodeURIComponent(fragment.replace(/^https?:\/\//, '')))) {
           this.naturalWidth = 150
           this.naturalHeight = 240
@@ -6684,6 +6760,9 @@ describe('per-tab search boxes', () => {
           this.naturalHeight = 240
         } else if (value.includes(encodeURIComponent(logo.replace(/^https?:\/\//, '')))) {
           this.naturalWidth = 240
+          this.naturalHeight = 240
+        } else {
+          this.naturalWidth = 400
           this.naturalHeight = 240
         }
         queueMicrotask(() => this.onload?.())
@@ -6706,10 +6785,69 @@ describe('per-tab search boxes', () => {
       expect(image?.src).not.toContain(encodeURIComponent(fragment.replace(/^https?:\/\//, '')))
     })
     expect(container.querySelectorAll('[class*="themeCoverEmpty"]').length).toBe(0)
+    expect(probed.length).toBeLessThanOrEqual(3)
 
     fireEvent.click(cover)
     await waitFor(() => expect(document.querySelector('[class*="lightboxImg"]')).toBeTruthy())
     expect((document.querySelector('[class*="lightboxImg"]') as HTMLImageElement).src).toBe(complete)
+  })
+
+  it('still finds a landscape theme cover when the first README probes fail geometry (#1060)', async () => {
+    const portraits = [1, 2, 3].map(n => `https://raw.githubusercontent.com/carol/whale-skin/HEAD/docs/a-${n}.png`)
+    const complete = 'https://raw.githubusercontent.com/carol/whale-skin/HEAD/docs/d.png'
+    const readmeUrl = 'https://raw.githubusercontent.com/carol/whale-skin/HEAD/README.md'
+    const readme = [
+      '# whale-skin',
+      '## Screenshots',
+      ...portraits.map((url, i) => `![screenshot ${i + 1}](${url})`),
+      `![screenshot 4](${complete})`,
+    ].join('\n')
+    vi.stubGlobal('fetch', vi.fn((url: string) => {
+      const path = String(url).split('?')[0]
+      const payload =
+        path === '/dsh-market/registry' ? { source: 'live', registry: REGISTRY }
+        : path === '/dsh-market/installed' ? { profile: 'web', installed: {}, live: [], disabled: [] }
+        : path === '/dsh-market/status' ? { active: false, pnpm: true, boot: 'boot-1', installed: {} }
+        : path === '/dsh-market/updates' ? { updates: {} }
+        : null
+      if (payload !== null) return Promise.resolve(new Response(JSON.stringify(payload), { status: 200 }))
+      if (path === readmeUrl) return Promise.resolve(new Response(readme, { status: 200 }))
+      return Promise.reject(new Error(`unstubbed fetch: ${String(url)}`))
+    }))
+    const probed: string[] = []
+    class ProbeImage {
+      naturalWidth = 0
+      naturalHeight = 0
+      onload: (() => void) | null = null
+      onerror: (() => void) | null = null
+      referrerPolicy = ''
+      decoding = ''
+      set src(value: string) {
+        probed.push(value)
+        if (value.includes(encodeURIComponent(complete.replace(/^https?:\/\//, '')))) {
+          this.naturalWidth = 427
+          this.naturalHeight = 240
+        } else {
+          this.naturalWidth = 150
+          this.naturalHeight = 240
+        }
+        queueMicrotask(() => this.onload?.())
+      }
+    }
+    vi.stubGlobal('Image', ProbeImage)
+    const THEME_SNAPSHOT = { preference: 'light', themes: [] as Array<{ id: string }> }
+    render(<MarketSection {...{
+      ...props(),
+      themeStore: { subscribe: () => () => {}, getSnapshot: () => THEME_SNAPSHOT },
+    }} />)
+
+    await screen.findByText('dsh-loop')
+    fireEvent.click(screen.getAllByRole('button', { name: en.tabThemes })[0])
+    const cover = await screen.findByRole('button', { name: `${en.themePreview} whale-skin` })
+    await waitFor(() => {
+      expect(cover.querySelector('img')?.src).toContain(encodeURIComponent(complete.replace(/^https?:\/\//, '')))
+    })
+    expect(probed.length).toBe(4)
   })
 
   it('lets the user enter and exit the themes full-screen gallery', async () => {
