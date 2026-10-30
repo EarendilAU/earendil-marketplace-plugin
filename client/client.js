@@ -639,7 +639,8 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 			webdavUpload: "上传备份",
 			webdavRestore: "从 WebDAV 恢复",
 			autoBackup: "每天自动备份（打开市场时）",
-			webdavNote: "WebDAV 地址与用户名仅保存在当前浏览器；密码只存于服务端，每次会话需重新输入。",
+			webdavNote: "WebDAV 地址与用户名仅保存在当前浏览器；密码只留在当前页面，刷新或重启后需要重新输入。",
+			webdavAutoBackupPaused: "每天自动备份没能完成：这个服务需要密码认证，而密码不会保存到磁盘，刷新或重启后要重新输入。填好后点「上传备份」即可。",
 			webdavPathHint: "填完整的文件地址（含文件名）：备份写进这个文件，恢复也从它读。开启自动备份后每天最多上传一次。",
 			localOnly: "WebDAV 地址和用户名只保存在此浏览器。",
 			credsWarning: "请注意：备份包含 profile 配置，以及可能含密钥的文件（config.toml、.env 等）。本地导出的文件会原样包含这些内容，上传 WebDAV 前请确认目标可信。",
@@ -1420,7 +1421,8 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 			webdavUpload: "Upload backup",
 			webdavRestore: "Restore from WebDAV",
 			autoBackup: "Back up daily (when the market opens)",
-			webdavNote: "The WebDAV URL and username stay in this browser only; the password is kept server-side and must be re-entered each session.",
+			webdavNote: "The WebDAV URL and username stay in this browser only; the password lives in this page and has to be re-entered after a reload.",
+			webdavAutoBackupPaused: "Daily backup could not run: this server needs a password, and the password is never stored, so it has to be entered again after a reload. Enter it and press Upload backup.",
 			webdavPathHint: "Give the whole file path, name included: the backup writes that file and restore reads it back. With automatic backup on it uploads at most once a day.",
 			localOnly: "The WebDAV URL and username stay in this browser only.",
 			credsWarning: "Note: backups include profile configuration and files that may hold secrets (config.toml, .env, …). Local exports are unmodified, so upload only to a WebDAV target you trust.",
@@ -2200,7 +2202,8 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 			webdavUpload: "バックアップをアップロード",
 			webdavRestore: "WebDAV から復元",
 			autoBackup: "毎日自動でバックアップ（マーケットを開いたとき）",
-			webdavNote: "WebDAV のアドレスとユーザー名はこのブラウザにのみ保存されます。パスワードはサーバー側にのみ保持され、セッションごとに再入力が必要です。",
+			webdavNote: "WebDAV のアドレスとユーザー名はこのブラウザにのみ保存されます。パスワードはこのページ内にのみ保持され、再読み込み後は再入力が必要です。",
+			webdavAutoBackupPaused: "毎日の自動バックアップは完了できませんでした。このサーバーはパスワード認証が必要ですが、パスワードは保存されないため、再読み込み後の再入力が必要です。入力して「バックアップをアップロード」を押してください。",
 			webdavPathHint: "ファイル名まで含めた完全なファイルアドレスを記入してください。バックアップはそのファイルに書き込まれ、復元もそこから読みます。自動バックアップをオンにすると、アップロードは 1 日に最大 1 回です。",
 			localOnly: "WebDAV のアドレスとユーザー名はこのブラウザにのみ保存されます。",
 			credsWarning: "注意：バックアップには profile の設定と、キーを含む可能性のあるファイル（config.toml、.env など）が含まれます。ローカルにエクスポートしたファイルにはそれらがそのまま入るため、WebDAV にアップロードする前に、送信先が信頼できることを確認してください。",
@@ -10370,6 +10373,16 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 			const [webdavUrl, setWebdavUrl] = (0, react.useState)(initialWebdav.url);
 			const [webdavUser, setWebdavUser] = (0, react.useState)(initialWebdav.username);
 			const [webdavPassword, setWebdavPassword] = (0, react.useState)(initialWebdav.password);
+			/**
+			* Auto-backup found a configured username but no password (#1058).
+			*
+			* The password is never written to browser storage (deliberate), so after a
+			* reload it is gone — and the daily upload then ran with an empty password
+			* and failed with a bare `HTTP 401` every time the market opened. A missing
+			* password is not a failure to retry blindly; it is a state the card should
+			* say out loud and the auto-run should not enter.
+			*/
+			const [webdavNeedsPassword, setWebdavNeedsPassword] = (0, react.useState)(false);
 			const [autoBackup, setAutoBackup] = (0, react.useState)(initialWebdav.auto);
 			/** GitHub token — session memory only, never written to any storage. */
 			const [gistToken, setGistToken] = (0, react.useState)("");
@@ -13108,7 +13121,15 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 						} catch {}
 						setBackupMessage(t("backupDone"));
 					}
-				}).catch((error) => setBackupMessage(String(error))).finally(() => {
+				}).catch((error) => {
+					const message = String(error);
+					if (action === "backup" && webdavPassword === "" && /HTTP 401|401/u.test(message)) {
+						setWebdavNeedsPassword(true);
+						setBackupMessage(null);
+						return;
+					}
+					setBackupMessage(message);
+				}).finally(() => {
 					webdavInFlight.current = false;
 					setBackupBusy(false);
 				});
@@ -14965,7 +14986,10 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 											autoComplete: "current-password",
 											value: webdavPassword,
 											placeholder: t("webdavPassword"),
-											onChange: (e) => setWebdavPassword(e.target.value)
+											onChange: (e) => {
+												setWebdavPassword(e.target.value);
+												if (e.target.value !== "") setWebdavNeedsPassword(false);
+											}
 										}),
 										/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
 											className: Market_module_css_default.backupActions,
@@ -14990,6 +15014,10 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 											onChange: setAutoBackup
 										}),
 										/* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", { children: t("webdavNote") }),
+										webdavNeedsPassword && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
+											className: Market_module_css_default.backupWarn,
+											children: t("webdavAutoBackupPaused")
+										}),
 										/* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
 											className: Market_module_css_default.backupWarn,
 											children: t("credsWarning")

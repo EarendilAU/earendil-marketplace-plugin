@@ -2781,6 +2781,16 @@ export function MarketSection(props: MarketSectionProps) {
   const [webdavUrl, setWebdavUrl] = useState(initialWebdav.url)
   const [webdavUser, setWebdavUser] = useState(initialWebdav.username)
   const [webdavPassword, setWebdavPassword] = useState(initialWebdav.password)
+  /**
+   * Auto-backup found a configured username but no password (#1058).
+   *
+   * The password is never written to browser storage (deliberate), so after a
+   * reload it is gone — and the daily upload then ran with an empty password
+   * and failed with a bare `HTTP 401` every time the market opened. A missing
+   * password is not a failure to retry blindly; it is a state the card should
+   * say out loud and the auto-run should not enter.
+   */
+  const [webdavNeedsPassword, setWebdavNeedsPassword] = useState(false)
   const [autoBackup, setAutoBackup] = useState(initialWebdav.auto)
   /** GitHub token — session memory only, never written to any storage. */
   const [gistToken, setGistToken] = useState('')
@@ -5728,7 +5738,19 @@ export function MarketSection(props: MarketSectionProps) {
         try { localStorage.setItem('dshm-webdav-last', String(Date.now())) } catch { /* storage unavailable */ }
         setBackupMessage(t('backupDone'))
       }
-    }).catch(error => setBackupMessage(String(error))).finally(() => {
+    }).catch(error => {
+      const message = String(error)
+      // #1058: a 401 with an empty password field is not a mystery — the
+      // password is never stored, so this is what every reload looks like.
+      // Name the state on the card instead of a bare `HTTP 401`, and clear it
+      // the moment a password is typed.
+      if (action === 'backup' && webdavPassword === '' && /HTTP 401|401/u.test(message)) {
+        setWebdavNeedsPassword(true)
+        setBackupMessage(null)
+        return
+      }
+      setBackupMessage(message)
+    }).finally(() => {
       webdavInFlight.current = false
       setBackupBusy(false)
     })
@@ -7352,7 +7374,7 @@ export function MarketSection(props: MarketSectionProps) {
                       name has to stay put: restore looks for that same one. */}
                   <p>{t('webdavPathHint')}</p>
                   <Input className={css.backupInput} autoComplete="username" value={webdavUser} placeholder={t('webdavUser')} onChange={e => setWebdavUser(e.target.value)} />
-                  <Input className={css.backupInput} type="password" autoComplete="current-password" value={webdavPassword} placeholder={t('webdavPassword')} onChange={e => setWebdavPassword(e.target.value)} />
+                  <Input className={css.backupInput} type="password" autoComplete="current-password" value={webdavPassword} placeholder={t('webdavPassword')} onChange={e => { setWebdavPassword(e.target.value); if (e.target.value !== '') setWebdavNeedsPassword(false) }} />
                   <div className={css.backupActions}>
                     <Button variant="primary" size="sm" disabled={backupBusy || webdavUrl.trim() === ''} onClick={() => runWebdav('backup')}>{backupBusy ? t('backupWorking') : t('webdavUpload')}</Button>
                     <Button variant="outline" size="sm" disabled={backupBusy || webdavUrl.trim() === ''} onClick={() => runWebdav('restore')}>{t('webdavRestore')}</Button>
@@ -7364,6 +7386,7 @@ export function MarketSection(props: MarketSectionProps) {
                     onChange: setAutoBackup,
                   })}
                   <p>{t('webdavNote')}</p>
+                  {webdavNeedsPassword && <p className={css.backupWarn}>{t('webdavAutoBackupPaused')}</p>}
                   <p className={css.backupWarn}>{t('credsWarning')}</p>
                 </section>
                 <section className={css.backupCard}>

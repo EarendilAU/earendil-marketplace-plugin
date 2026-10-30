@@ -204,6 +204,30 @@ describe('profile backup and restore', () => {
     expect(network.request).not.toHaveBeenCalled()
   })
 
+  it('explains a 401 instead of reporting the bare status (#1058)', async () => {
+    // The most common upload failure is also the most fixable one: the
+    // password is never stored, so a reload leaves the field empty and the
+    // server answers 401. The message has to name the cause and the way out.
+    const dir = profileDir('web')
+    mkdirSync(dir, { recursive: true })
+    writeFileSync(join(dir, 'package.json'), '{}')
+    const backup = createProfileBackup('web')
+    network.request.mockImplementation((_options, callback) => {
+      const response = Readable.from([])
+      Object.assign(response, { statusCode: 401, headers: {} })
+      const request = Object.assign(new EventEmitter(), { end: vi.fn() })
+      queueMicrotask(() => callback(response))
+      return request
+    })
+
+    const failure = await uploadWebdav('https://dav.example/dsh/backup.json', 'u', '', backup)
+      .catch((error: unknown) => String((error as Error).message))
+
+    expect(failure).toMatch(/401/u)
+    expect(failure).toMatch(/重新输入/u)
+    expect(failure).toMatch(/rejected these credentials/u)
+  })
+
   it('uploads and downloads the same backup through WebDAV', async () => {
     const dir = profileDir('web')
     mkdirSync(dir, { recursive: true })

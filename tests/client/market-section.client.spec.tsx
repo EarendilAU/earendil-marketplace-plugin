@@ -341,6 +341,24 @@ describe('WebDAV daily backup (#868)', () => {
     expect(requests()).toHaveLength(2)
   })
 
+  it('turns a password-less 401 into a stated condition, not a bare error (#1058)', async () => {
+    // The password is never stored, so after a reload the daily upload runs
+    // with an empty field and the server answers 401. The reporter met this
+    // as an `HTTP 401` banner on every market open, with nothing saying why.
+    localStorage.setItem('dshm-webdav', JSON.stringify(config))
+    stubFetch({ '/dsh-market/webdav': { __status: 401, error: 'WebDAV upload failed: HTTP 401' } })
+    render(<MarketSection {...props()} />)
+    await openBackup()
+
+    expect(await screen.findByText(en.webdavAutoBackupPaused)).toBeTruthy()
+    // The raw status is not repeated on top of the explanation.
+    expect(screen.queryByText(/HTTP 401/u)).toBeNull()
+    // Entering a password retires the note.
+    fireEvent.change(screen.getByPlaceholderText(en.webdavPassword), { target: { value: 'secret' } })
+    await act(async () => {})
+    expect(screen.queryByText(en.webdavAutoBackupPaused)).toBeNull()
+  })
+
   it('says what the address field wants, in the words the reporter had to guess (#868)', async () => {
     // "说明里面没有写清楚备份是个文件" — the field carried a placeholder and
     // nothing else, so the shape (file, name included) and the reason the name
