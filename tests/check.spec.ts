@@ -2263,6 +2263,26 @@ describe('satisfiesRange', () => {
     expect(satisfiesRange('1.2.4', '1.2.3')).toBe(false)
   })
 
+  it('matches explicit equality comparators without widening exact pins', () => {
+    expect(satisfiesRange('1.2.3', '=1.2.3')).toBe(true)
+    expect(satisfiesRange('1.2.4', '=1.2.3')).toBe(false)
+    expect(satisfiesRange('1.2.3-rc.1', '=1.2.3')).toBe(false)
+    const range = '=0.2.0-rc.2 || =0.2.1-rc.2 || =0.2.1-rc.3'
+    for (const includePrerelease of [false, true]) {
+      expect(satisfiesRange('0.2.0-rc.2', range, { includePrerelease })).toBe(true)
+      expect(satisfiesRange('0.2.1-rc.3', range, { includePrerelease })).toBe(true)
+      expect(satisfiesRange('0.2.1-rc.1', range, { includePrerelease })).toBe(false)
+      expect(satisfiesRange('0.2.1-rc.4', range, { includePrerelease })).toBe(false)
+    }
+  })
+
+  it('keeps unsupported partial and malformed equality comparators unknown', () => {
+    for (const range of ['=1.2', '=1', '=', '==1.2.3', '=^1.2.3']) {
+      expect(satisfiesRange('1.2.0', range)).toBeNull()
+      expect(satisfiesRange('1.2.0-rc.1', range, { includePrerelease: true })).toBeNull()
+    }
+  })
+
   it('handles prerelease comparisons against caret ranges', () => {
     expect(satisfiesRange('0.1.0-rc.6', '^0.1.0-rc.6')).toBe(true)
     expect(satisfiesRange('0.1.0', '^0.1.0-rc.6')).toBe(true)
