@@ -8299,6 +8299,31 @@ describe('card thumbnail + lightbox (curated screenshots only)', () => {
     expect(shots[1]?.getAttribute('src')).toBe(cardThumb(SHOT_B))
   })
 
+  it('loads the full-size screenshot through the configured GitHub route (#1070)', async () => {
+    // On a mainland connection raw.githubusercontent.com is the slowest host
+    // on the page, while the avatar beside it already went through the proxy
+    // the user picked. The lightbox is the one place that needs the original
+    // bytes, so it is the one that most needs that proxy.
+    resetMarketPortalHost()
+    stubFetch({
+      '/dsh-market/registry': { source: 'live', registry: registryWithShots() },
+      '/dsh-market/status': { githubRoutes: { raw: ['https://gh-proxy.example'], avatar: [null] }, githubProxy: null },
+    })
+    const { container } = render(<MarketSection {...props()} />)
+    await screen.findByText('dsh-loop')
+    await waitFor(() => expect(fetchCalls.some(call => call.path === '/dsh-market/status')).toBe(true))
+    await act(async () => {})
+
+    fireEvent.click(container.querySelector('img[class*="cardShot"]')!)
+
+    const img = await waitFor(() => {
+      const found = document.querySelector('[class*="lightboxImg"]') as HTMLImageElement | null
+      expect(found).toBeTruthy()
+      return found!
+    })
+    expect(img.getAttribute('src')).toBe(`https://gh-proxy.example/${SHOT_A}`)
+  })
+
   it('portals into a container of its own, never straight into document.body (#293)', async () => {
     // The host's settings dialog is a separate React root that also portals
     // to document.body. Two roots adding and removing children of the SAME

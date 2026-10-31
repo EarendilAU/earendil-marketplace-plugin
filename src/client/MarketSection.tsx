@@ -3,7 +3,7 @@
  * /dsh-market/* host routes, with install/update/uninstall flows and the
  * pending-restart bookkeeping in sessionStorage.
  */
-import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore, type CSSProperties, type ReactElement, type ReactNode, type Ref } from 'react'
+import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore, type CSSProperties, type MouseEvent as ReactMouseEvent, type ReactElement, type ReactNode, type Ref } from 'react'
 import { createPortal } from 'react-dom'
 import {
   Button,
@@ -1049,6 +1049,41 @@ function useWindowTitlebarHeight(): number {
  * already-downloaded image shown bigger — there is no separate "thumbnail"
  * vs "full size" asset to fetch.
  */
+/**
+ * The full-size screenshot, loaded through the configured GitHub route (#1070).
+ *
+ * Screenshots are GitHub-hosted, and on a mainland connection
+ * `raw.githubusercontent.com` is the slowest part of the page — the avatars
+ * next to them already go through the proxy the user chose, while this one
+ * still went direct. The thumbnail keeps its own resizer; this is the one
+ * place that wants the original bytes, so it is the one place the proxy
+ * itself is worth a hop.
+ *
+ * The route order is the same one avatars use: the prefix that last worked
+ * first, then the region's other prefixes, then direct. A failed load walks
+ * the list rather than leaving a blank image.
+ */
+function LightboxImage({ src, className, onClick }: {
+  src: string
+  className: string
+  onClick: (event: ReactMouseEvent<HTMLImageElement>) => void
+}) {
+  const [routeIndex, setRouteIndex] = useState(0)
+  useEffect(() => { setRouteIndex(0) }, [src])
+  const candidates = githubRouteCandidates('raw', src)
+  const candidate = candidates[Math.min(routeIndex, candidates.length - 1)]!
+  return (
+    <img
+      className={className}
+      src={candidate.url}
+      alt=""
+      onClick={onClick}
+      onLoad={() => rememberGithubRoute('raw', candidate.proxy)}
+      onError={() => { if (routeIndex + 1 < candidates.length) setRouteIndex(current => current + 1) }}
+    />
+  )
+}
+
 function ScreenshotLightbox({ shots, startIndex, onClose, t }: { shots: string[]; startIndex: number; onClose: () => void; t: Translate }) {
   // Full-bleed previews must not auto-advance: a chart or a screenshot needs
   // to stay readable until the viewer moves on, so the carousel timer is
@@ -1107,7 +1142,11 @@ function ScreenshotLightbox({ shots, startIndex, onClose, t }: { shots: string[]
         aria-label={t('lightboxClose')}
         onClick={onClose}
       >×</button>
-      <img className={css.lightboxImg} src={shots[index]} alt="" onClick={e => e.stopPropagation()} />
+      <LightboxImage
+        className={css.lightboxImg}
+        src={shots[index]!}
+        onClick={e => e.stopPropagation()}
+      />
       {shots.length > 1 && (
         <>
           <button

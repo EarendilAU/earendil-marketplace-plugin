@@ -8724,6 +8724,38 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 		* already-downloaded image shown bigger — there is no separate "thumbnail"
 		* vs "full size" asset to fetch.
 		*/
+		/**
+		* The full-size screenshot, loaded through the configured GitHub route (#1070).
+		*
+		* Screenshots are GitHub-hosted, and on a mainland connection
+		* `raw.githubusercontent.com` is the slowest part of the page — the avatars
+		* next to them already go through the proxy the user chose, while this one
+		* still went direct. The thumbnail keeps its own resizer; this is the one
+		* place that wants the original bytes, so it is the one place the proxy
+		* itself is worth a hop.
+		*
+		* The route order is the same one avatars use: the prefix that last worked
+		* first, then the region's other prefixes, then direct. A failed load walks
+		* the list rather than leaving a blank image.
+		*/
+		function LightboxImage({ src, className, onClick }) {
+			const [routeIndex, setRouteIndex] = (0, react.useState)(0);
+			(0, react.useEffect)(() => {
+				setRouteIndex(0);
+			}, [src]);
+			const candidates = githubRouteCandidates("raw", src);
+			const candidate = candidates[Math.min(routeIndex, candidates.length - 1)];
+			return /* @__PURE__ */ (0, react_jsx_runtime.jsx)("img", {
+				className,
+				src: candidate.url,
+				alt: "",
+				onClick,
+				onLoad: () => rememberGithubRoute("raw", candidate.proxy),
+				onError: () => {
+					if (routeIndex + 1 < candidates.length) setRouteIndex((current) => current + 1);
+				}
+			});
+		}
 		function ScreenshotLightbox({ shots, startIndex, onClose, t }) {
 			const [index, setIndex] = useAutoCarousel(shots.length, startIndex, 0);
 			const titlebarHeight = useWindowTitlebarHeight();
@@ -8755,10 +8787,9 @@ window.__ModuleLoader__.load({ id: "dshmarket", factory: (require) => {
 						onClick: onClose,
 						children: "×"
 					}),
-					/* @__PURE__ */ (0, react_jsx_runtime.jsx)("img", {
+					/* @__PURE__ */ (0, react_jsx_runtime.jsx)(LightboxImage, {
 						className: Market_module_css_default.lightboxImg,
 						src: shots[index],
-						alt: "",
 						onClick: (e) => e.stopPropagation()
 					}),
 					shots.length > 1 && /* @__PURE__ */ (0, react_jsx_runtime.jsxs)(react_jsx_runtime.Fragment, { children: [
