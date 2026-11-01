@@ -187,7 +187,7 @@ describe('official Electron profile runtime', () => {
       const runtime = createOfficialDesktopRuntime(() => service, 'desktop', profile())
 
       const removing = runtime.runPlugin('desktop', ['remove', 'example'])
-      await vi.advanceTimersByTimeAsync(90_001)
+      await vi.advanceTimersByTimeAsync(300_001)
       const result = await removing
 
       expect(result.exitCode).toBe(1)
@@ -200,6 +200,32 @@ describe('official Electron profile runtime', () => {
       expect(result.stderr).toContain('没有在限定时间内答复这次操作')
       expect(result.stderr).toContain('did not answer this operation in time')
       expect(result.stderr).not.toContain('新版本却还没装上')
+      await runtime.dispose()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('keeps waiting while pnpm is retrying the registry rather than failing the removal at 90 s (#1057)', async () => {
+    // Reported: an update's removal was still in pnpm's own retry budget
+    // (`UND_ERR_CONNECT_TIMEOUT … Will retry in 10 seconds. 2 retries left`)
+    // when the old 90 s bound expired, so a transient became a permanent
+    // failure and the host's manager then rewrote the manifest from its stale
+    // snapshot. A removal that answers inside the retry budget must succeed.
+    vi.useFakeTimers()
+    try {
+      const service = manager()
+      let settle: ((result: { application: string }) => void) | undefined
+      service.removeBundle.mockImplementationOnce(() => new Promise(resolve => {
+        settle = resolve
+      }))
+      const runtime = createOfficialDesktopRuntime(() => service, 'desktop', profile())
+
+      const removing = runtime.runPlugin('desktop', ['remove', 'example'])
+      await vi.advanceTimersByTimeAsync(150_000)
+      settle?.({ application: 'applied' })
+
+      await expect(removing).resolves.toMatchObject({ exitCode: 0 })
       await runtime.dispose()
     } finally {
       vi.useRealTimers()
@@ -618,7 +644,7 @@ describe('official Electron profile runtime', () => {
     const runtime = createOfficialDesktopRuntime(() => service, 'desktop', dir)
     try {
       const running = runtime.runPlugin('desktop', ['add', 'example@2.0.0'])
-      await vi.advanceTimersByTimeAsync(90_000)
+      await vi.advanceTimersByTimeAsync(300_000)
       const result = await running
       expect(result).toMatchObject({
         exitCode: 1,

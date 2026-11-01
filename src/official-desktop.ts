@@ -40,11 +40,29 @@ interface ManagedResult {
  * resolve and the operation stays "updating" forever while holding the
  * profile's write lock. These deadlines cannot cancel the host, but they end
  * the market's wait, and the journal (`./pending-updates.ts`) makes the next
- * start finish the job. Removal is the short step (pnpm unlink + unload);
- * installation may legitimately download and build, so it gets the longer one.
+ * start finish the job.
+ *
+ * Both are the same length on purpose (#1057). Removal is short when pnpm
+ * only unlinks, but the host runs every command through the profile's
+ * supply-chain verification first, and that reaches the network: the reported
+ * update died at 90 s while pnpm was doing the right thing
+ * (`GET … UND_ERR_CONNECT_TIMEOUT. Will retry in 10 seconds. 2 retries left`),
+ * and the host's own manager then rewrote the manifest from its stale
+ * snapshot two minutes later. A deadline is here to end an infinite wait, not
+ * to race pnpm's retry budget — a transient that resolves by itself must not
+ * turn into a permanent failure.
  */
-const REMOVE_DEADLINE_MS = 90_000
+const REMOVE_DEADLINE_MS = 300_000
 const INSTALL_DEADLINE_MS = 300_000
+/**
+ * The bound around a whole `add`, which may be an update and therefore holds
+ * two bounded phases in a row. It has to stay strictly longer than their sum:
+ * an outer bound equal to the inner one fires at the same instant and decides
+ * the answer instead — that is how a timeout stopped being reported as
+ * "the update did not finish" and started being reported as the plain
+ * operation refusal (#928's spec caught it).
+ */
+const OPERATION_DEADLINE_MS = REMOVE_DEADLINE_MS + INSTALL_DEADLINE_MS
 
 export interface OfficialPluginManagerLike {
   installBundle(spec: string, options?: { requestId?: string; registry?: string }): Promise<ManagedResult>
@@ -526,7 +544,7 @@ export function createOfficialDesktopRuntime(
       // "working" forever, while its pnpm had in fact finished seconds later.
       // The update path has had these deadlines for exactly that reason; an
       // ordinary install or uninstall needs the same bound.
-      const deadline = command === 'remove' ? REMOVE_DEADLINE_MS : INSTALL_DEADLINE_MS
+      const deadline = command === 'remove' ? REMOVE_DEADLINE_MS : OPERATION_DEADLINE_MS
       operation = withDeadline(
         command === 'remove'
           ? manager.removeBundle(target)
