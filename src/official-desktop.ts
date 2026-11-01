@@ -145,6 +145,14 @@ const REFUSAL_COPY: Record<string, { zh: string; en: string }> = {
     zh: '这个版本与当前 DSH 不兼容，宿主拒绝安装',
     en: 'this version is not compatible with the running DSH, so the host refused it',
   },
+  // An ordinary install or uninstall that the manager never answered (#1066).
+  // Deliberately not `update-incomplete`: that sentence ("the plugin may
+  // already be removed while its replacement never installed") is about the
+  // remove-then-install pair and reads as nonsense on a plain uninstall.
+  'operation-incomplete': {
+    zh: '桌面端没有在限定时间内答复这次操作：磁盘上可能已经改完了，市场只是没等到答复，所以没有回滚。重新打开 DSH 后市场会按磁盘状态核对；状态不对的话从「设置 → 插件」处理',
+    en: 'the desktop app did not answer this operation in time: the change may already be on disk, and the market got no reply, so it rolled nothing back. Reopen DSH and the market checks what is actually there; if it still looks wrong, use Settings → Plugins',
+  },
   'update-incomplete': {
     zh: '桌面端没有在限定时间内完成这次更新：插件可能已经被移除，新版本却还没装上。重新打开 DSH 后市场会自动补装；也可以现在从「设置 → 插件」重试',
     en: 'the desktop app did not finish this update in time: the plugin may already be removed while its replacement never installed. Reopen DSH and the market will finish the install, or retry from Settings → Plugins now',
@@ -513,9 +521,29 @@ export function createOfficialDesktopRuntime(
       // An explicit uninstall supersedes an interrupted update for the same
       // package: the journal must not put back what the user just removed.
       if (command === 'remove') updateContext?.journal.forget(profileName, target)
-      operation = command === 'remove'
-        ? manager.removeBundle(target)
-        : installOrReinstall(manager, spec, options, updateContext)
+      // The host's manager has no deadline of its own (#1066): a call that
+      // never settles held the profile's write lock and left the panel saying
+      // "working" forever, while its pnpm had in fact finished seconds later.
+      // The update path has had these deadlines for exactly that reason; an
+      // ordinary install or uninstall needs the same bound.
+      const deadline = command === 'remove' ? REMOVE_DEADLINE_MS : INSTALL_DEADLINE_MS
+      operation = withDeadline(
+        command === 'remove'
+          ? manager.removeBundle(target)
+          : installOrReinstall(manager, spec, options, updateContext),
+        deadline,
+        `${command} ${target}`,
+      ).catch((error: unknown) => {
+        if (!(error instanceof DeadlineExceeded)) throw error
+        return {
+          application: 'failed' as const,
+          // Neither "nothing happened" nor "undo it": the manager may have
+          // written the change already. The next start reconciles against
+          // disk instead of the market inventing an answer here.
+          repairOnRestart: true,
+          error: { code: 'operation-incomplete' },
+        }
+      })
     } catch (error) {
       progress.active = false
       return Promise.resolve(failure(detail(error), 127))

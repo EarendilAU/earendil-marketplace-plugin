@@ -175,6 +175,37 @@ describe('official Electron profile runtime', () => {
     await runtime.dispose()
   })
 
+  it('stops waiting when an ordinary uninstall never answers (#1066)', async () => {
+    // The update path has had these deadlines for a while; ordinary
+    // remove/add awaited the host forever. Reported: the panel stayed on
+    // "working", the profile's package.json.lock stayed held, and the disk
+    // had in fact been changed seconds earlier.
+    vi.useFakeTimers()
+    try {
+      const service = manager()
+      service.removeBundle.mockImplementationOnce(() => new Promise(() => {}))
+      const runtime = createOfficialDesktopRuntime(() => service, 'desktop', profile())
+
+      const removing = runtime.runPlugin('desktop', ['remove', 'example'])
+      await vi.advanceTimersByTimeAsync(90_001)
+      const result = await removing
+
+      expect(result.exitCode).toBe(1)
+      // Neither "nothing happened" nor "undo it": the manager may have
+      // written the change already.
+      expect(result.repairOnRestart).toBe(true)
+      // Names what happened, what the market did NOT do, and the next step —
+      // and does not borrow the update path's "its replacement never
+      // installed" sentence, which is nonsense on a plain uninstall.
+      expect(result.stderr).toContain('没有在限定时间内答复这次操作')
+      expect(result.stderr).toContain('did not answer this operation in time')
+      expect(result.stderr).not.toContain('新版本却还没装上')
+      await runtime.dispose()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('refuses another profile, absent service, and unsupported pnpm flags', async () => {
     const service = manager()
     const runtime = createOfficialDesktopRuntime(() => service, 'desktop', profile())
