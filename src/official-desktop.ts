@@ -604,7 +604,7 @@ export function createOfficialDesktopRuntime(
   }
 
   const repairPendingUpdates = async (): Promise<RepairReport> => {
-    const empty: RepairReport = { reinstalled: [], finished: [], failed: [] }
+    const empty: RepairReport = { reinstalled: [], finished: [], failed: [], abandoned: [] }
     if (disposed || repairing || active !== undefined) return empty
     const manager = managerLookup()
     if (manager === undefined || directory === undefined || journal === undefined) return empty
