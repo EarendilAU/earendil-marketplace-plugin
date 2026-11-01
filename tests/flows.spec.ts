@@ -1672,6 +1672,22 @@ describe('install flow', () => {
     expect(listed.json.activation['dsh-loop'].state).toBe('live')
   })
 
+  it('answers /installed when a loader row carries a numeric id (#1071)', async () => {
+    // `- id: 1` in cordis.patch.yml is parsed as the NUMBER 1 and the host's
+    // loader accepts it. `.split(':')` on it threw out of the handler, the
+    // webserver turned that into 400 with an empty body, and the UI rendered
+    // it as "no community plugins installed" — pointing the user at the wrong
+    // thing entirely.
+    fake.npm['dsh-loop'] = { latest: '1.0.0', versions: { '1.0.0': { manifest: { dsh: {}, main: 'lib/index.js' }, artifacts: ['lib/index.js'] } } }
+    await bed.dispatch('POST', '/dsh-market/install', { url: 'https://github.com/o/dsh-loop' })
+    bed.loaderEntries.push({ options: { id: 1, name: 'dsh-qqbot' } as never, fiber: {}, update: vi.fn() })
+
+    const listed = await bed.dispatch('GET', '/dsh-market/installed')
+
+    expect(listed.status).toBe(200)
+    expect(listed.json.installed['dsh-loop']).toBe('^1.0.0')
+  })
+
   it('treats an install as success when pnpm wrote then the host boot hit EADDRINUSE (#975)', async () => {
     fake.npm['dsh-loop'] = { latest: '1.0.0', versions: { '1.0.0': { manifest: { dsh: {}, main: 'lib/index.js' }, artifacts: ['lib/index.js'] } } }
     fake.failAfterWriteStderrOnce = [

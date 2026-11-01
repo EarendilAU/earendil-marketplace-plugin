@@ -175,6 +175,63 @@ describe('official Electron profile runtime', () => {
     await runtime.dispose()
   })
 
+  it('stops waiting when an ordinary uninstall never answers (#1066)', async () => {
+    // The update path has had these deadlines for a while; ordinary
+    // remove/add awaited the host forever. Reported: the panel stayed on
+    // "working", the profile's package.json.lock stayed held, and the disk
+    // had in fact been changed seconds earlier.
+    vi.useFakeTimers()
+    try {
+      const service = manager()
+      service.removeBundle.mockImplementationOnce(() => new Promise(() => {}))
+      const runtime = createOfficialDesktopRuntime(() => service, 'desktop', profile())
+
+      const removing = runtime.runPlugin('desktop', ['remove', 'example'])
+      await vi.advanceTimersByTimeAsync(300_001)
+      const result = await removing
+
+      expect(result.exitCode).toBe(1)
+      // Neither "nothing happened" nor "undo it": the manager may have
+      // written the change already.
+      expect(result.repairOnRestart).toBe(true)
+      // Names what happened, what the market did NOT do, and the next step —
+      // and does not borrow the update path's "its replacement never
+      // installed" sentence, which is nonsense on a plain uninstall.
+      expect(result.stderr).toContain('没有在限定时间内答复这次操作')
+      expect(result.stderr).toContain('did not answer this operation in time')
+      expect(result.stderr).not.toContain('新版本却还没装上')
+      await runtime.dispose()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('keeps waiting while pnpm is retrying the registry rather than failing the removal at 90 s (#1057)', async () => {
+    // Reported: an update's removal was still in pnpm's own retry budget
+    // (`UND_ERR_CONNECT_TIMEOUT … Will retry in 10 seconds. 2 retries left`)
+    // when the old 90 s bound expired, so a transient became a permanent
+    // failure and the host's manager then rewrote the manifest from its stale
+    // snapshot. A removal that answers inside the retry budget must succeed.
+    vi.useFakeTimers()
+    try {
+      const service = manager()
+      let settle: ((result: { application: string }) => void) | undefined
+      service.removeBundle.mockImplementationOnce(() => new Promise(resolve => {
+        settle = resolve
+      }))
+      const runtime = createOfficialDesktopRuntime(() => service, 'desktop', profile())
+
+      const removing = runtime.runPlugin('desktop', ['remove', 'example'])
+      await vi.advanceTimersByTimeAsync(150_000)
+      settle?.({ application: 'applied' })
+
+      await expect(removing).resolves.toMatchObject({ exitCode: 0 })
+      await runtime.dispose()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('refuses another profile, absent service, and unsupported pnpm flags', async () => {
     const service = manager()
     const runtime = createOfficialDesktopRuntime(() => service, 'desktop', profile())
@@ -587,7 +644,7 @@ describe('official Electron profile runtime', () => {
     const runtime = createOfficialDesktopRuntime(() => service, 'desktop', dir)
     try {
       const running = runtime.runPlugin('desktop', ['add', 'example@2.0.0'])
-      await vi.advanceTimersByTimeAsync(90_000)
+      await vi.advanceTimersByTimeAsync(300_000)
       const result = await running
       expect(result).toMatchObject({
         exitCode: 1,

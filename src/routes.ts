@@ -23,7 +23,7 @@ import {
 } from './hot.ts'
 import { createGroup, deleteGroup, removeFromGroups, renameGroup, setGroupMembers } from './groups.ts'
 import { dshHostInfo, findDshInstallDir } from './dsh-install.ts'
-import { deriveHostCompatibility, DiscoveryManifestIndex, findCompatibleVersion } from './discovery-compatibility.ts'
+import { catalogReleaseManifest, deriveHostCompatibility, DiscoveryManifestIndex, findCompatibleVersion } from './discovery-compatibility.ts'
 import { configurePersistentLog, exportLogs, logEvent, readPersistentLog } from './log.ts'
 import { marketFetch } from './net.ts'
 import { diagnosePackageManifests } from './diagnostics.ts'
@@ -65,7 +65,7 @@ import { detectedDebugger, detectedSupervisor, restartAllowed, scheduleRestart, 
 import type { RecoveryPlugin } from './recovery.ts'
 import { activationAfterReplace, brokenClientBundles, bundlePatchIsEmpty, checkClientBundle, defaultHostRuntimeFacts, findUnservedConfigNamespaces, hasHostHalf, hostPeerGate, isDeclaredLibraryDsh, newlyBrokenBundles, peerGateRemedy, verifyActivation } from './verify.ts'
 import {
-  carrierRowIds, disableRow, enableRow, findUserPatchPath, foreignRowIds, isProtectedModule, packagePatchFlags,
+  carrierRowIds, disableRow, enableRow, findUserPatchPath, foreignRowIds, isProtectedModule, loaderEntryId, packagePatchFlags,
   readUserPatchState, removeRowBlocks, rowIdsForPackage, userPatchPackageReferences,
 } from './patch.ts'
 import {
@@ -1373,11 +1373,15 @@ export function mountMarketRoutes(
       // here — but the id it created does, and that id is unique to its
       // patch. Verification needs both, and putting them in one set means
       // no call site can pass the names and forget the ids.
-      if (entry.options.id !== undefined && entry.options.id !== '') {
-        live.add(`#${entry.options.id}`)
+      // `id: 1` in the patch file is a NUMBER by the time the loader holds
+      // it, and `.split` on it took the whole `/installed` handler down with
+      // a 400 and an empty body (#1071).
+      const entryId = loaderEntryId(entry)
+      if (entryId !== '') {
+        live.add(`#${entryId}`)
         // Loader ids may carry an include prefix (`include:archify-…`).
-        const bare = entry.options.id.split(':').pop()
-        if (bare !== undefined && bare !== entry.options.id) live.add(`#${bare}`)
+        const bare = entryId.split(':').pop()
+        if (bare !== undefined && bare !== entryId) live.add(`#${bare}`)
       }
     }
     return live
@@ -3227,11 +3231,15 @@ export function mountMarketRoutes(
           const host = dshHostInfo()
           const hostVersion = host?.version ?? null
           const hostPackages = corePackageNames(host?.directory ?? null)
+          const catalogFacts = Object.fromEntries(entries.flatMap(entry => {
+            const facts = catalogReleaseManifest(entry)
+            return facts === null ? [] : [[entry.url, facts]]
+          }))
           const [npmFacts, githubFacts] = await Promise.all([
             discoveryManifests.lookup(packages, routesFor(region).npmRegistry),
-            githubDiscoveryManifests.lookupGitHub(entries),
+            githubDiscoveryManifests.lookupGitHub(entries.filter(entry => catalogFacts[entry.url] === undefined)),
           ])
-          const facts = { ...npmFacts, ...githubFacts }
+          const facts = { ...npmFacts, ...githubFacts, ...catalogFacts }
           const plugins = Object.fromEntries([...packages, ...urls].map(name => [
             name,
             deriveHostCompatibility(facts[name] ?? null, hostVersion, hostPackages),
@@ -3406,8 +3414,9 @@ export function mountMarketRoutes(
         const servedEntryIds = new Set<string>([...patch.inserts, ...patch.disables, ...patch.forced])
         for (const ids of ownEntryIds.values()) for (const id of ids) servedEntryIds.add(id)
         for (const entry of host.loader.entries()) {
-          const id = entry.options?.id
-          if (id === undefined || id === '') continue
+          // Same numeric-id trap as `liveNames()` (#1071).
+          const id = loaderEntryId(entry)
+          if (id === '') continue
           servedEntryIds.add(id)
           const bare = id.split(':').pop()
           if (bare !== undefined) servedEntryIds.add(bare)

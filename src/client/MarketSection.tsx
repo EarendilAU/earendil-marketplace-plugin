@@ -3,7 +3,7 @@
  * /dsh-market/* host routes, with install/update/uninstall flows and the
  * pending-restart bookkeeping in sessionStorage.
  */
-import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore, type CSSProperties, type ReactNode, type Ref } from 'react'
+import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore, type CSSProperties, type MouseEvent as ReactMouseEvent, type ReactElement, type ReactNode, type Ref } from 'react'
 import { createPortal } from 'react-dom'
 import {
   Button,
@@ -42,7 +42,7 @@ import css from './Market.module.css'
 import { MARK_BLOCK_RADIUS, MARK_BLOCK_SIZE, MARK_GRID_BLOCKS, MARK_PLUG_BLOCK, MARK_VIEW_BOX } from './market-mark.ts'
 import { CommentsModal } from './CommentsModal.tsx'
 import { SearchInput } from './SearchInput.tsx'
-import { downloadStatsText } from './download-stats.ts'
+import { downloadStatistic, downloadStatsText, starStatsText } from './download-stats.ts'
 import { OperationsPanel } from './OperationsPanel.tsx'
 import { applyRecovery, fetchRecovery, initialKeep, RecoveryPanel, watchRestart, type RecoveryView } from './RecoveryPanel.tsx'
 import { HostRecoveryBanner } from './HostRecoveryBanner.tsx'
@@ -55,7 +55,7 @@ import type { SidebarEntry } from './sidebar-entry.ts'
 import {
   installCommandFor, hostCompatibilityKey,
   api, applyGithubRouting, avatarColor, catalogEntryForInstalled, entryForDep, failureText, githubRouteCandidates, groupSwitchState, installedForCatalog, isGenerationSpec, isInstalled, localizeBilingual, localizeBilingualList, looksTerminal, matchInstalledName, orderedCategories, pluginCategories,
-  formatCount, pageItems, pluginName, blockAliases, pluginScreenshotCandidates, pluginScreenshots, pluginsForFavorites, queuedRowApplies, rankThemeScreenshots, readSession, safeIcon, releaseNotesHttpsImage, rememberGithubRoute, resetScreenshotsCache, resolveCatalogRestore, safeScreenshots, sanitizeReleaseNotesBody, staleFavoriteUrls, themePlugins as themePluginsOf, themeSwatch, TIME_RANGE_DAYS, visiblePlugins, restartHintKey,
+  formatCount, pageItems, pluginName, blockAliases, pluginScreenshotCandidates, pluginScreenshots, pluginsForFavorites, previewDimensionScore, queuedRowApplies, rankThemeScreenshots, readSession, safeIcon, releaseNotesHttpsImage, rememberGithubRoute, resetScreenshotsCache, resolveCatalogRestore, safeScreenshots, sanitizeReleaseNotesBody, staleFavoriteUrls, themePlugins as themePluginsOf, themeSwatch, TIME_RANGE_DAYS, visiblePlugins, restartHintKey,
 } from './market-data.ts'
 import type {
 ActivationInfo, ActivationState, DrainHistoryWire, DrainOperationWire, GistExportResult, InstalledMap, InstalledRepoHints, InstalledRepoIdentities, MarketStatus, Registry, RegistryPlugin,
@@ -623,7 +623,7 @@ function useAutoCarousel(count: number, initial: number, intervalMs = 3500): [nu
  * left to save, and once the thumbnail is genuinely smaller it can no longer
  * share a cache entry with the full-size open anyway.
  */
-function thumbUrl(src: string, height: number): string {
+function thumbUrl(src: string, height: number, options: { webp?: boolean } = {}): string {
   // The resizer stays in every region, including China.
   //
   // It was briefly bypassed there on the assumption that a service in the
@@ -632,7 +632,14 @@ function thumbUrl(src: string, height: number): string {
   // in 1.39s, and it answers with 23KB where the original is 41KB. Routing
   // around it would have traded a working request for a bigger one, on a
   // page that makes dozens of them.
-  return `https://images.weserv.nl/?url=${encodeURIComponent(src.replace(/^https?:\/\//, ''))}&h=${String(height)}&fit=inside&we=1`
+  const encoded = encodeURIComponent(src.replace(/^https?:\/\//, ''))
+  let url = `https://images.weserv.nl/?url=${encoded}&h=${String(height)}&fit=inside&we=1`
+  // Theme covers ask for webp on still photos: a 520px PNG of a UI
+  // screenshot still weighed 0.4–0.6 MB (#1060). Only png/jpeg/webp URLs
+  // opt in — GIFs and extension-less GitHub attachments stay resized-only
+  // so an animated cover is not flattened to its first frame.
+  if (options.webp === true && /\.(?:png|jpe?g|webp)(?:$|[?#])/iu.test(src)) url += '&output=webp'
+  return url
 }
 
 /**
@@ -675,6 +682,17 @@ function useNearViewport<T extends Element>(rootMargin = '200px'): [(node: T | n
 /** Thumbnails per card. The dialog shows every screenshot; a grid of cards
  * pulling six full-size PNGs each is what makes the first paint crawl. */
 const CARD_SHOT_LIMIT = 3
+/**
+ * Theme gallery is 4-up (16:10 tile ≈ 150px tall in a typical panel). 320px
+ * is ~2× that; 520 was a near-full-bleed PNG and still hundreds of KB (#1060).
+ */
+const THEME_COVER_HEIGHT = 320
+/** About half a cover row — off-screen theme cards must not prefetch. */
+const THEME_COVER_ROOT_MARGIN = '80px'
+/** First-pass geometry probes for a README fallback. If none of these
+ * pass as a cover, the remaining candidates (still capped at six) are
+ * measured too — otherwise a later landscape is dropped before ranking. */
+const THEME_PREVIEW_PROBE_LIMIT = 3
 
 function CardShot({ plugin, onOpen }: { plugin: RegistryPlugin; onOpen: (shots: string[], index: number) => void }) {
   const shots = safeScreenshots(plugin.screenshots)
@@ -709,24 +727,30 @@ function CardShot({ plugin, onOpen }: { plugin: RegistryPlugin; onOpen: (shots: 
  */
 function measureThemeCandidates(candidates: ScreenshotCandidate[]): Promise<ScreenshotMeasurement[]> {
   if (typeof Image === 'undefined') return Promise.resolve([])
-  return Promise.all(candidates.map(candidate => new Promise<ScreenshotMeasurement | null>((resolve) => {
-    const probe = new Image()
-    let settled = false
-    const finish = (measurement: ScreenshotMeasurement | null) => {
-      if (settled) return
-      settled = true
-      window.clearTimeout(timer)
-      probe.onload = null
-      probe.onerror = null
-      resolve(measurement)
-    }
-    const timer = window.setTimeout(() => finish(null), 6_000)
-    probe.onload = () => finish({ src: candidate.src, width: probe.naturalWidth, height: probe.naturalHeight })
-    probe.onerror = () => finish(null)
-    probe.referrerPolicy = 'no-referrer'
-    probe.decoding = 'async'
-    probe.src = thumbUrl(candidate.src, 240)
-  }))).then(results => results.filter((result): result is ScreenshotMeasurement => result !== null))
+  const measureBatch = (batch: ScreenshotCandidate[]): Promise<ScreenshotMeasurement[]> =>
+    Promise.all(batch.map(candidate => new Promise<ScreenshotMeasurement | null>((resolve) => {
+      const probe = new Image()
+      let settled = false
+      const finish = (measurement: ScreenshotMeasurement | null) => {
+        if (settled) return
+        settled = true
+        window.clearTimeout(timer)
+        probe.onload = null
+        probe.onerror = null
+        resolve(measurement)
+      }
+      const timer = window.setTimeout(() => finish(null), 6_000)
+      probe.onload = () => finish({ src: candidate.src, width: probe.naturalWidth, height: probe.naturalHeight })
+      probe.onerror = () => finish(null)
+      probe.referrerPolicy = 'no-referrer'
+      probe.decoding = 'async'
+      probe.src = thumbUrl(candidate.src, 240)
+    }))).then(results => results.filter((result): result is ScreenshotMeasurement => result !== null))
+  return measureBatch(candidates.slice(0, THEME_PREVIEW_PROBE_LIMIT)).then(first => {
+    if (first.some(item => previewDimensionScore(item.width, item.height) !== null)
+      || candidates.length <= THEME_PREVIEW_PROBE_LIMIT) return first
+    return measureBatch(candidates.slice(THEME_PREVIEW_PROBE_LIMIT)).then(rest => first.concat(rest))
+  })
 }
 
 const measuredThemePreviewTasks = new Map<string, Promise<string[]>>()
@@ -775,7 +799,7 @@ function ThemeCover({ plugin, onOpen, t }: {
     shots: cachedFallback ?? [],
   })
   const [broken, setBroken] = useState<string[]>([])
-  const [setCoverRef, near] = useNearViewport<HTMLButtonElement>()
+  const [setCoverRef, near] = useNearViewport<HTMLButtonElement>(THEME_COVER_ROOT_MARGIN)
   useEffect(() => {
     setBroken([])
     if (curated.length > 0) {
@@ -827,7 +851,7 @@ function ThemeCover({ plugin, onOpen, t }: {
       onClick={() => onOpen(visible, 0)}
     >
       <img
-        src={near ? thumbUrl(src, 520) : undefined}
+        src={near ? thumbUrl(src, THEME_COVER_HEIGHT, { webp: true }) : undefined}
         alt=""
         loading="lazy"
         decoding="async"
@@ -1025,6 +1049,41 @@ function useWindowTitlebarHeight(): number {
  * already-downloaded image shown bigger — there is no separate "thumbnail"
  * vs "full size" asset to fetch.
  */
+/**
+ * The full-size screenshot, loaded through the configured GitHub route (#1070).
+ *
+ * Screenshots are GitHub-hosted, and on a mainland connection
+ * `raw.githubusercontent.com` is the slowest part of the page — the avatars
+ * next to them already go through the proxy the user chose, while this one
+ * still went direct. The thumbnail keeps its own resizer; this is the one
+ * place that wants the original bytes, so it is the one place the proxy
+ * itself is worth a hop.
+ *
+ * The route order is the same one avatars use: the prefix that last worked
+ * first, then the region's other prefixes, then direct. A failed load walks
+ * the list rather than leaving a blank image.
+ */
+function LightboxImage({ src, className, onClick }: {
+  src: string
+  className: string
+  onClick: (event: ReactMouseEvent<HTMLImageElement>) => void
+}) {
+  const [routeIndex, setRouteIndex] = useState(0)
+  useEffect(() => { setRouteIndex(0) }, [src])
+  const candidates = githubRouteCandidates('raw', src)
+  const candidate = candidates[Math.min(routeIndex, candidates.length - 1)]!
+  return (
+    <img
+      className={className}
+      src={candidate.url}
+      alt=""
+      onClick={onClick}
+      onLoad={() => rememberGithubRoute('raw', candidate.proxy)}
+      onError={() => { if (routeIndex + 1 < candidates.length) setRouteIndex(current => current + 1) }}
+    />
+  )
+}
+
 function ScreenshotLightbox({ shots, startIndex, onClose, t }: { shots: string[]; startIndex: number; onClose: () => void; t: Translate }) {
   // Full-bleed previews must not auto-advance: a chart or a screenshot needs
   // to stay readable until the viewer moves on, so the carousel timer is
@@ -1083,7 +1142,11 @@ function ScreenshotLightbox({ shots, startIndex, onClose, t }: { shots: string[]
         aria-label={t('lightboxClose')}
         onClick={onClose}
       >×</button>
-      <img className={css.lightboxImg} src={shots[index]} alt="" onClick={e => e.stopPropagation()} />
+      <LightboxImage
+        className={css.lightboxImg}
+        src={shots[index]!}
+        onClick={e => e.stopPropagation()}
+      />
       {shots.length > 1 && (
         <>
           <button
@@ -1256,6 +1319,34 @@ function GithubRepoMark({ size = 12, className }: { size?: number; className?: s
   )
 }
 
+/**
+ * Sweeping cards or the recent strip must not flash tips. Same dwell as
+ * the recent-tile name/blurb tips.
+ */
+const HOVER_TIP_DELAY_MS = 700
+
+/**
+ * Hover tips on catalog cards. Matches official Discover placement
+ * (`portal`, `side="bottom"`) so the bubble escapes card overflow and the
+ * theme-card hover transform, and does not cover the name. Extra props
+ * are ignored on hosts whose Tooltip is older than portal.
+ */
+function CardTip({
+  label,
+  maxWidth,
+  children,
+}: {
+  label: string
+  maxWidth?: number
+  children: ReactElement
+}): ReactElement {
+  return (
+    <Tooltip label={label} side="bottom" delayMs={HOVER_TIP_DELAY_MS} portal maxWidth={maxWidth}>
+      {children}
+    </Tooltip>
+  )
+}
+
 /** Bookmark toggle on catalog cards (#414). Outline when off, filled when on —
  * deliberately not a star, which the byline already uses for GitHub popularity. */
 /**
@@ -1276,7 +1367,7 @@ function GithubRepoMark({ size = 12, className }: { size?: number; className?: s
 function FavoriteButton({ filled, label, onToggle }: { filled: boolean; label: string; onToggle: () => void }) {
   const markRef = useRef<SVGSVGElement>(null)
   return (
-    <Tooltip label={label} side="top">
+    <CardTip label={label}>
       <button
         type="button"
         className={filled ? `${css.favoriteBtn} ${css.favoriteOn}` : css.favoriteBtn}
@@ -1303,7 +1394,7 @@ function FavoriteButton({ filled, label, onToggle }: { filled: boolean; label: s
       >
         <BookmarkMark filled={filled} className={css.favoriteMark} markRef={markRef} />
       </button>
-    </Tooltip>
+    </CardTip>
   )
 }
 
@@ -1338,17 +1429,26 @@ function BookmarkMark({ size = 14, filled = false, className, markRef }: {
   )
 }
 
-/** A compact rolling-period label, with source metadata on hover or focus. */
+/** Compact count; hover names the exact figure, source and reporting scope. */
 function DownloadCount({ plugin, t }: { plugin: RegistryPlugin; t: Translate }) {
   const tip = downloadStatsText(plugin, t)
-  if (tip === null) return null
+  const statistic = downloadStatistic(plugin)
+  if (tip === null || statistic === null) return null
   return (
-    <Tooltip label={tip} side="top">
+    <CardTip label={tip}>
       <span className={css.star} tabIndex={0} aria-label={tip}>
-        {'· ↓ ' + formatCount(plugin.downloads!)}
+        {'· ' + (statistic.source === 'github' ? 'GitHub ' : '') + '↓ ' + formatCount(statistic.count)}
       </span>
-    </Tooltip>
+    </CardTip>
   )
+}
+
+function StarCount({ plugin, t }: { plugin: RegistryPlugin; t: Translate }) {
+  const tip = starStatsText(plugin, t)
+  if (tip === null) return null
+  return <CardTip label={tip}><span className={css.star} tabIndex={0} aria-label={tip}>
+    {'· ★ ' + formatCount(plugin.stars!)}
+  </span></CardTip>
 }
 
 /** Monochrome mark for one fact in front of the capability fold. Ink, not a warning colour. */
@@ -1621,9 +1721,9 @@ function CatalogVersionMark({ version, tip }: { version: string | null | undefin
   if (typeof version !== 'string' || version.length === 0) return null
   const label = /^v/i.test(version) ? version : `v${version}`
   return (
-    <Tooltip label={tip} side="top">
+    <CardTip label={tip} maxWidth={280}>
       <span className={css.star}>{`· ${label}`}</span>
-    </Tooltip>
+    </CardTip>
   )
 }
 
@@ -2021,8 +2121,6 @@ const RECENT_HIDDEN_KEY = 'dshm-recent-hidden'
 /** Cap for the Discover teaser. Extra tiles live in a quiet horizontal
  * scroll so the block stays one row tall. */
 const RECENT_STRIP_LIMIT = 8
-/** Sweeping the strip must not flash tips; dwell before the host bubble. */
-const RECENT_TIP_DELAY_MS = 700
 function readRecentFlag(key: string): boolean {
   try { return localStorage.getItem(key) === '1' } catch { return false }
 }
@@ -2731,6 +2829,16 @@ export function MarketSection(props: MarketSectionProps) {
   const [webdavUrl, setWebdavUrl] = useState(initialWebdav.url)
   const [webdavUser, setWebdavUser] = useState(initialWebdav.username)
   const [webdavPassword, setWebdavPassword] = useState(initialWebdav.password)
+  /**
+   * Auto-backup found a configured username but no password (#1058).
+   *
+   * The password is never written to browser storage (deliberate), so after a
+   * reload it is gone — and the daily upload then ran with an empty password
+   * and failed with a bare `HTTP 401` every time the market opened. A missing
+   * password is not a failure to retry blindly; it is a state the card should
+   * say out loud and the auto-run should not enter.
+   */
+  const [webdavNeedsPassword, setWebdavNeedsPassword] = useState(false)
   const [autoBackup, setAutoBackup] = useState(initialWebdav.auto)
   /** GitHub token — session memory only, never written to any storage. */
   const [gistToken, setGistToken] = useState('')
@@ -5678,7 +5786,19 @@ export function MarketSection(props: MarketSectionProps) {
         try { localStorage.setItem('dshm-webdav-last', String(Date.now())) } catch { /* storage unavailable */ }
         setBackupMessage(t('backupDone'))
       }
-    }).catch(error => setBackupMessage(String(error))).finally(() => {
+    }).catch(error => {
+      const message = String(error)
+      // #1058: a 401 with an empty password field is not a mystery — the
+      // password is never stored, so this is what every reload looks like.
+      // Name the state on the card instead of a bare `HTTP 401`, and clear it
+      // the moment a password is typed.
+      if (action === 'backup' && webdavPassword === '' && /HTTP 401|401/u.test(message)) {
+        setWebdavNeedsPassword(true)
+        setBackupMessage(null)
+        return
+      }
+      setBackupMessage(message)
+    }).finally(() => {
       webdavInFlight.current = false
       setBackupBusy(false)
     })
@@ -6282,7 +6402,7 @@ export function MarketSection(props: MarketSectionProps) {
         <div className={css.recentTitle}>
           <OwnerAvatar name={p.name} owner={p.owner || ''} icon={p.icon ?? undefined} className={css.recentAv} />
           <div className={css.recentName}>
-            <Tooltip label={p.name} side="bottom" maxWidth={320} delayMs={RECENT_TIP_DELAY_MS}>
+            <Tooltip label={p.name} side="bottom" maxWidth={320} delayMs={HOVER_TIP_DELAY_MS}>
               <a className={`${css.nm} ${css.nmLink}`} href={p.url} target="_blank" rel="noreferrer" aria-label={`${p.name} — ${t('repoLink')}`}>
                 {pluginName(p.name, p.npm)}
               </a>
@@ -6292,7 +6412,7 @@ export function MarketSection(props: MarketSectionProps) {
         </div>
         <div className={css.recentBottom}>
           {desc !== '' && (
-            <Tooltip label={desc} side="bottom" maxWidth={320} delayMs={RECENT_TIP_DELAY_MS}>
+            <Tooltip label={desc} side="bottom" maxWidth={320} delayMs={HOVER_TIP_DELAY_MS}>
               <p className={css.recentDesc} tabIndex={0}>{desc}</p>
             </Tooltip>
           )}
@@ -6345,11 +6465,7 @@ export function MarketSection(props: MarketSectionProps) {
               <span className={css.owner} title={p.owner}>{p.owner}</span>
               <CatalogVersionMark version={p.version} tip={catalogVersionTip} />
               <DownloadCount plugin={p} t={t} />
-              {typeof p.stars === 'number' && (
-                <Tooltip label={String(p.stars)} side="top">
-                  <span className={css.star}>{'· ★ ' + formatCount(p.stars)}</span>
-                </Tooltip>
-              )}
+              <StarCount plugin={p} t={t} />
             </div>
           </div>
           {/* Top right, at its natural size: in the footer it needed a row of
@@ -6377,14 +6493,14 @@ export function MarketSection(props: MarketSectionProps) {
         <div className={css.foot}>
           <div className={css.footTags}>
             <span
-          className={compatibility?.status === 'incompatible'
-            ? `${css.hostRequirement} ${css.hostRequirementBad}`
-            : css.hostRequirement}
-          data-status={compatibility?.status ?? 'unknown'}
-          title={(compatibility?.status === 'compatible' || compatibility?.status === 'incompatible'
-            ? t(compatibility.status === 'compatible' ? 'hostStatusCompatible' : 'hostStatusIncompatible') + '\n'
-            : '') + hostRequirementTitle}
-        >{hostRequirementLabel}</span>
+              className={compatibility?.status === 'incompatible'
+                ? `${css.hostRequirement} ${css.hostRequirementBad}`
+                : css.hostRequirement}
+              data-status={compatibility?.status ?? 'unknown'}
+              title={(compatibility?.status === 'compatible' || compatibility?.status === 'incompatible'
+                ? t(compatibility.status === 'compatible' ? 'hostStatusCompatible' : 'hostStatusIncompatible') + '\n'
+                : '') + hostRequirementTitle}
+            >{hostRequirementLabel}</span>
             {pluginCategories(p).map(category => (
               <span key={category} className={css.tag}>
                 {(data!.categories[category] && (data!.categories[category]![lang] || data!.categories[category]!.en)) || category}
@@ -6464,11 +6580,7 @@ export function MarketSection(props: MarketSectionProps) {
                 <span className={css.owner} title={p.owner}>{p.owner}</span>
                 <CatalogVersionMark version={p.version} tip={catalogVersionTip} />
                 <DownloadCount plugin={p} t={t} />
-                {typeof p.stars === 'number' && (
-                  <Tooltip label={String(p.stars)} side="top">
-                    <span className={css.star}>{'· ★ ' + formatCount(p.stars)}</span>
-                  </Tooltip>
-                )}
+                <StarCount plugin={p} t={t} />
               </div>
             </div>
             {p.deprecated === true && <span className={css.depBadge}>{t('deprecatedBadge')}</span>}
@@ -7302,7 +7414,7 @@ export function MarketSection(props: MarketSectionProps) {
                       name has to stay put: restore looks for that same one. */}
                   <p>{t('webdavPathHint')}</p>
                   <Input className={css.backupInput} autoComplete="username" value={webdavUser} placeholder={t('webdavUser')} onChange={e => setWebdavUser(e.target.value)} />
-                  <Input className={css.backupInput} type="password" autoComplete="current-password" value={webdavPassword} placeholder={t('webdavPassword')} onChange={e => setWebdavPassword(e.target.value)} />
+                  <Input className={css.backupInput} type="password" autoComplete="current-password" value={webdavPassword} placeholder={t('webdavPassword')} onChange={e => { setWebdavPassword(e.target.value); if (e.target.value !== '') setWebdavNeedsPassword(false) }} />
                   <div className={css.backupActions}>
                     <Button variant="primary" size="sm" disabled={backupBusy || webdavUrl.trim() === ''} onClick={() => runWebdav('backup')}>{backupBusy ? t('backupWorking') : t('webdavUpload')}</Button>
                     <Button variant="outline" size="sm" disabled={backupBusy || webdavUrl.trim() === ''} onClick={() => runWebdav('restore')}>{t('webdavRestore')}</Button>
@@ -7314,6 +7426,7 @@ export function MarketSection(props: MarketSectionProps) {
                     onChange: setAutoBackup,
                   })}
                   <p>{t('webdavNote')}</p>
+                  {webdavNeedsPassword && <p className={css.backupWarn}>{t('webdavAutoBackupPaused')}</p>}
                   <p className={css.backupWarn}>{t('credsWarning')}</p>
                 </section>
                 <section className={css.backupCard}>
@@ -8576,18 +8689,16 @@ export function MarketSection(props: MarketSectionProps) {
           {/* The detail dialog has to show at LEAST what the card already
               does — owner, version, downloads, stars, published date, category —
               a "detail" view that shows less than the summary it opened from
-              is backwards. The rolling-window explanation stays on the
-              download mark (hover, focus, aria-label): repeating it as the
-              first paragraph made the methodology louder than the blurb (#739). */}
+              is backwards. The download number's meaning stays on the mark
+              (hover, focus, aria-label), not as a paragraph above the blurb
+              (#739). */}
           <div className={css.confirmBody}>
           <div className={css.byline}>
             <OwnerAvatar name={confirming.name} owner={confirming.owner || ''} icon={confirming.icon ?? undefined} />
             <span className={css.owner} title={confirming.owner}>{confirming.owner}</span>
             <CatalogVersionMark version={confirming.version} tip={catalogVersionTip} />
             <DownloadCount plugin={confirming} t={t} />
-            {typeof confirming.stars === 'number' && (
-              <span className={css.star}>{'· ★ ' + formatCount(confirming.stars)}</span>
-            )}
+            <StarCount plugin={confirming} t={t} />
             {confirming.added && (
               <span className={css.star} title={t('published')}>{`· ${confirming.added}`}</span>
             )}

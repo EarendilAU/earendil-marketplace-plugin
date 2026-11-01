@@ -341,6 +341,24 @@ describe('WebDAV daily backup (#868)', () => {
     expect(requests()).toHaveLength(2)
   })
 
+  it('turns a password-less 401 into a stated condition, not a bare error (#1058)', async () => {
+    // The password is never stored, so after a reload the daily upload runs
+    // with an empty field and the server answers 401. The reporter met this
+    // as an `HTTP 401` banner on every market open, with nothing saying why.
+    localStorage.setItem('dshm-webdav', JSON.stringify(config))
+    stubFetch({ '/dsh-market/webdav': { __status: 401, error: 'WebDAV upload failed: HTTP 401' } })
+    render(<MarketSection {...props()} />)
+    await openBackup()
+
+    expect(await screen.findByText(en.webdavAutoBackupPaused)).toBeTruthy()
+    // The raw status is not repeated on top of the explanation.
+    expect(screen.queryByText(/HTTP 401/u)).toBeNull()
+    // Entering a password retires the note.
+    fireEvent.change(screen.getByPlaceholderText(en.webdavPassword), { target: { value: 'secret' } })
+    await act(async () => {})
+    expect(screen.queryByText(en.webdavAutoBackupPaused)).toBeNull()
+  })
+
   it('says what the address field wants, in the words the reporter had to guess (#868)', async () => {
     // "说明里面没有写清楚备份是个文件" — the field carried a placeholder and
     // nothing else, so the shape (file, name included) and the reason the name
@@ -3898,6 +3916,20 @@ describe('card hover does not cover footer actions (#1021)', () => {
 })
 
 describe('discover card download count stays compact', () => {
+  it('shows a GitHub-only release count with its source, collection time and pinned version', async () => {
+    const plugin = { ...REGISTRY.plugins[0]!, npm: null, downloads: null, version: '1.3.0',
+      githubReleaseDownloads: 7000, githubReleaseDownloadsCheckedAt: '2026-10-31T08:35:00.000Z',
+      stars: 45, starsCheckedAt: '2026-10-31T08:35:00.000Z' }
+    stubFetch({ '/dsh-market/registry': { hostVersion: '0.2.1-rc.5', registry: { ...REGISTRY, count: 1, plugins: [plugin] } } })
+    render(<MarketSection {...props()} />)
+    const card = (await screen.findByText('dsh-loop')).closest('[class*="card"]') as HTMLElement
+    expect(within(card).getByText('· GitHub ↓ 7k')).toBeTruthy()
+    expect(within(card).getByText('· v1.3.0')).toBeTruthy()
+    expect(within(card).getByLabelText(/GitHub Release asset downloads, all time: 7000.*2026-10-31 08:35 UTC/)).toBeTruthy()
+    expect(within(card).getByLabelText(/GitHub stars: 45.*2026-10-31 08:35 UTC/)).toBeTruthy()
+    expect(within(card).queryByLabelText(/Last 30 days on npm/)).toBeNull()
+  })
+
   it('shows the count on the card; the period stays in the tooltip', async () => {
     // #996 put " / 30d" on every byline. That string is already in the
     // tooltip, and on a two-up card it wraps the author row onto three lines.
@@ -3922,6 +3954,36 @@ describe('discover card download count stays compact', () => {
     const tip = downloadStatsText(plugin, props().t)
     expect(tip).toBeTruthy()
     expect(within(card).getByLabelText(tip!)).toBeTruthy()
+  })
+})
+
+describe('catalog card tips match official Discover', () => {
+  it('waits 700ms and opens below the anchor', async () => {
+    render(<MarketSection {...props()} />)
+    const name = await screen.findByText('dsh-loop')
+    const card = name.closest('[class*="card"]') as HTMLElement
+    const fav = within(card).getByRole('button', { name: en.favoriteAdd })
+
+    vi.useFakeTimers()
+    try {
+      fireEvent.mouseEnter(fav)
+      expect(screen.queryByRole('tooltip')).toBeNull()
+      await act(async () => { await vi.advanceTimersByTimeAsync(699) })
+      expect(screen.queryByRole('tooltip')).toBeNull()
+      await act(async () => { await vi.advanceTimersByTimeAsync(1) })
+      const tip = screen.getByRole('tooltip')
+      expect(tip.textContent).toBe(en.favoriteAdd)
+      expect(tip.getAttribute('data-side')).toBe('bottom')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('asks the host Tooltip to portal out of the card, at the recent-strip delay', () => {
+    const source = readFileSync(resolve('src/client/MarketSection.tsx'), 'utf8')
+    expect(source).toMatch(/function CardTip/)
+    expect(source).toMatch(/const HOVER_TIP_DELAY_MS = 700/)
+    expect(source).toMatch(/delayMs=\{HOVER_TIP_DELAY_MS\} portal/)
   })
 })
 
@@ -6644,17 +6706,91 @@ describe('per-tab search boxes', () => {
     expect((document.querySelector('[class*="lightboxImg"]') as HTMLImageElement).src).toBe(shotA)
   })
 
+  /**
+   * Theme covers used h=520 PNG, which on a 4-up grid is far above the painted
+   * 16:10 tile and still hundreds of KB (#1060). The lightbox keeps the original.
+   */
+  it('loads a compact webp theme cover, not a 520px PNG or the original (#1060)', async () => {
+    const shotA = 'https://raw.githubusercontent.com/carol/whale-skin/main/assets/light.png'
+    const registry = JSON.parse(JSON.stringify(REGISTRY))
+    registry.plugins[2].screenshots = [shotA]
+    stubFetch({ '/dsh-market/registry': { source: 'live', registry } })
+    const THEME_SNAPSHOT = { preference: 'light', themes: [] as Array<{ id: string }> }
+    render(<MarketSection {...{
+      ...props(),
+      themeStore: { subscribe: () => () => {}, getSnapshot: () => THEME_SNAPSHOT },
+    }} />)
+
+    await screen.findByText('dsh-loop')
+    fireEvent.click(screen.getAllByRole('button', { name: en.tabThemes })[0])
+    const cover = await screen.findByRole('button', { name: `${en.themePreview} whale-skin` })
+    const src = cover.querySelector('img')?.getAttribute('src') ?? ''
+    const encoded = encodeURIComponent(shotA.replace(/^https?:\/\//, ''))
+    expect(src).toBe(`https://images.weserv.nl/?url=${encoded}&h=320&fit=inside&we=1&output=webp`)
+    expect(src).not.toContain('h=520')
+    expect(src).not.toBe(shotA)
+  })
+
+  it('keeps a GIF theme cover on the original format so the animation is not flattened (#1060)', async () => {
+    const shotA = 'https://raw.githubusercontent.com/carol/whale-skin/main/assets/cover.gif'
+    const registry = JSON.parse(JSON.stringify(REGISTRY))
+    registry.plugins[2].screenshots = [shotA]
+    stubFetch({ '/dsh-market/registry': { source: 'live', registry } })
+    const THEME_SNAPSHOT = { preference: 'light', themes: [] as Array<{ id: string }> }
+    render(<MarketSection {...{
+      ...props(),
+      themeStore: { subscribe: () => () => {}, getSnapshot: () => THEME_SNAPSHOT },
+    }} />)
+
+    await screen.findByText('dsh-loop')
+    fireEvent.click(screen.getAllByRole('button', { name: en.tabThemes })[0])
+    const cover = await screen.findByRole('button', { name: `${en.themePreview} whale-skin` })
+    const src = cover.querySelector('img')?.getAttribute('src') ?? ''
+    expect(src).toContain('h=320')
+    expect(src).not.toContain('output=webp')
+  })
+
+  it('does not transcode a GitHub attachment theme cover to webp (#1060)', async () => {
+    const shotA = 'https://github.com/user-attachments/assets/d732b30f-2649-4758-bc7a-c57a1cac6e14'
+    const registry = JSON.parse(JSON.stringify(REGISTRY))
+    registry.plugins[2].screenshots = [shotA]
+    stubFetch({ '/dsh-market/registry': { source: 'live', registry } })
+    const THEME_SNAPSHOT = { preference: 'light', themes: [] as Array<{ id: string }> }
+    render(<MarketSection {...{
+      ...props(),
+      themeStore: { subscribe: () => () => {}, getSnapshot: () => THEME_SNAPSHOT },
+    }} />)
+
+    await screen.findByText('dsh-loop')
+    fireEvent.click(screen.getAllByRole('button', { name: en.tabThemes })[0])
+    const cover = await screen.findByRole('button', { name: `${en.themePreview} whale-skin` })
+    const src = cover.querySelector('img')?.getAttribute('src') ?? ''
+    expect(src).toContain('h=320')
+    expect(src).not.toContain('output=webp')
+  })
+
+  it('asks the theme-cover observer for a short root margin so off-screen rows do not prefetch (#1060)', () => {
+    const source = readFileSync(resolve('src/client/MarketSection.tsx'), 'utf8')
+    expect(source).toMatch(/const THEME_COVER_HEIGHT = 320/)
+    expect(source).toMatch(/const THEME_COVER_ROOT_MARGIN = '80px'/)
+    expect(source).toMatch(/useNearViewport<HTMLButtonElement>\(THEME_COVER_ROOT_MARGIN\)/)
+    expect(source).toMatch(/thumbUrl\(src, THEME_COVER_HEIGHT, \{ webp: true \}\)/)
+    expect(source).toMatch(/const THEME_PREVIEW_PROBE_LIMIT = 3/)
+  })
+
   it('fills a missing theme cover from README and chooses the complete landscape screenshot', async () => {
     const logo = 'https://raw.githubusercontent.com/carol/whale-skin/HEAD/assets/logo.png'
     const fragment = 'https://raw.githubusercontent.com/carol/whale-skin/HEAD/assets/settings-screenshot.png'
     const complete = 'https://raw.githubusercontent.com/carol/whale-skin/HEAD/docs/theme-preview.png'
     const readmeUrl = 'https://raw.githubusercontent.com/carol/whale-skin/HEAD/README.md'
+    const extra = [4, 5, 6].map(n => `https://raw.githubusercontent.com/carol/whale-skin/HEAD/docs/extra-${n}.png`)
     const readme = [
       '# whale-skin',
       '![project logo](assets/logo.png)',
       '## Screenshots',
       '![settings screenshot](assets/settings-screenshot.png)',
       '![Full theme preview](docs/theme-preview.png)',
+      ...extra.map((url, i) => `![screenshot extra ${i + 4}](${url})`),
     ].join('\n')
     vi.stubGlobal('fetch', vi.fn((url: string) => {
       const path = String(url).split('?')[0]
@@ -6668,6 +6804,7 @@ describe('per-tab search boxes', () => {
       if (path === readmeUrl) return Promise.resolve(new Response(readme, { status: 200 }))
       return Promise.reject(new Error(`unstubbed fetch: ${String(url)}`))
     }))
+    const probed: string[] = []
     class ProbeImage {
       naturalWidth = 0
       naturalHeight = 0
@@ -6676,6 +6813,7 @@ describe('per-tab search boxes', () => {
       referrerPolicy = ''
       decoding = ''
       set src(value: string) {
+        probed.push(value)
         if (value.includes(encodeURIComponent(fragment.replace(/^https?:\/\//, '')))) {
           this.naturalWidth = 150
           this.naturalHeight = 240
@@ -6684,6 +6822,9 @@ describe('per-tab search boxes', () => {
           this.naturalHeight = 240
         } else if (value.includes(encodeURIComponent(logo.replace(/^https?:\/\//, '')))) {
           this.naturalWidth = 240
+          this.naturalHeight = 240
+        } else {
+          this.naturalWidth = 400
           this.naturalHeight = 240
         }
         queueMicrotask(() => this.onload?.())
@@ -6706,10 +6847,69 @@ describe('per-tab search boxes', () => {
       expect(image?.src).not.toContain(encodeURIComponent(fragment.replace(/^https?:\/\//, '')))
     })
     expect(container.querySelectorAll('[class*="themeCoverEmpty"]').length).toBe(0)
+    expect(probed.length).toBeLessThanOrEqual(3)
 
     fireEvent.click(cover)
     await waitFor(() => expect(document.querySelector('[class*="lightboxImg"]')).toBeTruthy())
     expect((document.querySelector('[class*="lightboxImg"]') as HTMLImageElement).src).toBe(complete)
+  })
+
+  it('still finds a landscape theme cover when the first README probes fail geometry (#1060)', async () => {
+    const portraits = [1, 2, 3].map(n => `https://raw.githubusercontent.com/carol/whale-skin/HEAD/docs/a-${n}.png`)
+    const complete = 'https://raw.githubusercontent.com/carol/whale-skin/HEAD/docs/d.png'
+    const readmeUrl = 'https://raw.githubusercontent.com/carol/whale-skin/HEAD/README.md'
+    const readme = [
+      '# whale-skin',
+      '## Screenshots',
+      ...portraits.map((url, i) => `![screenshot ${i + 1}](${url})`),
+      `![screenshot 4](${complete})`,
+    ].join('\n')
+    vi.stubGlobal('fetch', vi.fn((url: string) => {
+      const path = String(url).split('?')[0]
+      const payload =
+        path === '/dsh-market/registry' ? { source: 'live', registry: REGISTRY }
+        : path === '/dsh-market/installed' ? { profile: 'web', installed: {}, live: [], disabled: [] }
+        : path === '/dsh-market/status' ? { active: false, pnpm: true, boot: 'boot-1', installed: {} }
+        : path === '/dsh-market/updates' ? { updates: {} }
+        : null
+      if (payload !== null) return Promise.resolve(new Response(JSON.stringify(payload), { status: 200 }))
+      if (path === readmeUrl) return Promise.resolve(new Response(readme, { status: 200 }))
+      return Promise.reject(new Error(`unstubbed fetch: ${String(url)}`))
+    }))
+    const probed: string[] = []
+    class ProbeImage {
+      naturalWidth = 0
+      naturalHeight = 0
+      onload: (() => void) | null = null
+      onerror: (() => void) | null = null
+      referrerPolicy = ''
+      decoding = ''
+      set src(value: string) {
+        probed.push(value)
+        if (value.includes(encodeURIComponent(complete.replace(/^https?:\/\//, '')))) {
+          this.naturalWidth = 427
+          this.naturalHeight = 240
+        } else {
+          this.naturalWidth = 150
+          this.naturalHeight = 240
+        }
+        queueMicrotask(() => this.onload?.())
+      }
+    }
+    vi.stubGlobal('Image', ProbeImage)
+    const THEME_SNAPSHOT = { preference: 'light', themes: [] as Array<{ id: string }> }
+    render(<MarketSection {...{
+      ...props(),
+      themeStore: { subscribe: () => () => {}, getSnapshot: () => THEME_SNAPSHOT },
+    }} />)
+
+    await screen.findByText('dsh-loop')
+    fireEvent.click(screen.getAllByRole('button', { name: en.tabThemes })[0])
+    const cover = await screen.findByRole('button', { name: `${en.themePreview} whale-skin` })
+    await waitFor(() => {
+      expect(cover.querySelector('img')?.src).toContain(encodeURIComponent(complete.replace(/^https?:\/\//, '')))
+    })
+    expect(probed.length).toBe(4)
   })
 
   it('lets the user enter and exit the themes full-screen gallery', async () => {
@@ -8079,24 +8279,24 @@ describe('card thumbnail + lightbox (curated screenshots only)', () => {
     })
     stubFetch({ '/dsh-market/registry': { source: 'live', registry } })
     render(<MarketSection {...props()} />)
-    await screen.findByText('dsh-loop')
-    const count = screen.getByLabelText(/npm rolling 30-day downloads: 4200/)
+    const tip = downloadStatsText(registry.plugins[0]!, props().t)!
+    // Wait on the labelled mark itself: the name can paint before the
+    // registry fields that feed the tip have been applied to the card.
+    const count = await screen.findByLabelText(tip)
     expect(count.textContent).toBe('· ↓ 4.2k')
     expect(count.getAttribute('tabindex')).toBe('0')
-    expect(count.getAttribute('aria-label')).toContain('2026-08-25 to 2026-09-23')
-    expect(count.getAttribute('aria-label')).toContain('2026-09-24')
-    let card: HTMLElement | null = screen.getByText('dsh-loop')
+    expect(count.getAttribute('aria-label')).not.toContain('2026-09-24')
+    let card: HTMLElement | null = count
     while (card !== null && within(card).queryAllByRole('button', { name: en.install }).length === 0) card = card.parentElement
     fireEvent.click(within(card!).getAllByRole('button', { name: en.install })[0]!)
     await screen.findByRole('button', { name: en.confirmInstall })
-    // The dialog carries the methodology on its own download mark, not as a
+    // The dialog names the count on its own download mark, not as a
     // second paragraph in the body (#739).
     const dialog = within(screen.getByRole('dialog'))
-    const dialogCount = dialog.getByLabelText(/npm rolling 30-day downloads: 4200/)
+    const dialogCount = dialog.getByLabelText(tip)
     expect(dialogCount.getAttribute('tabindex')).toBe('0')
-    expect(dialogCount.getAttribute('aria-label')?.toLowerCase()).toContain('not lifetime downloads or unique users')
-    expect(dialogCount.getAttribute('aria-label')).toContain('2026-09-24')
-    expect(dialog.queryByText(/Source checked at: 2026-09-24/)).toBeNull()
+    expect(dialogCount.getAttribute('aria-label')).toBe(tip)
+    expect(dialog.queryByText(tip)).toBeNull()
   })
 
   it('shows a scrollable thumbnail strip only on the card with curated screenshots', async () => {
@@ -8111,6 +8311,31 @@ describe('card thumbnail + lightbox (curated screenshots only)', () => {
     expect(shots.length).toBe(2)
     expect(shots[0]?.getAttribute('src')).toBe(cardThumb(SHOT_A))
     expect(shots[1]?.getAttribute('src')).toBe(cardThumb(SHOT_B))
+  })
+
+  it('loads the full-size screenshot through the configured GitHub route (#1070)', async () => {
+    // On a mainland connection raw.githubusercontent.com is the slowest host
+    // on the page, while the avatar beside it already went through the proxy
+    // the user picked. The lightbox is the one place that needs the original
+    // bytes, so it is the one that most needs that proxy.
+    resetMarketPortalHost()
+    stubFetch({
+      '/dsh-market/registry': { source: 'live', registry: registryWithShots() },
+      '/dsh-market/status': { githubRoutes: { raw: ['https://gh-proxy.example'], avatar: [null] }, githubProxy: null },
+    })
+    const { container } = render(<MarketSection {...props()} />)
+    await screen.findByText('dsh-loop')
+    await waitFor(() => expect(fetchCalls.some(call => call.path === '/dsh-market/status')).toBe(true))
+    await act(async () => {})
+
+    fireEvent.click(container.querySelector('img[class*="cardShot"]')!)
+
+    const img = await waitFor(() => {
+      const found = document.querySelector('[class*="lightboxImg"]') as HTMLImageElement | null
+      expect(found).toBeTruthy()
+      return found!
+    })
+    expect(img.getAttribute('src')).toBe(`https://gh-proxy.example/${SHOT_A}`)
   })
 
   it('portals into a container of its own, never straight into document.body (#293)', async () => {
